@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>fugue — ephemeral rooms</title>
+<meta name="description" content="Ephemeral encrypted rooms. No accounts. No storage. No traces.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@300;400;500;600&family=Geist:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+
+<link rel="stylesheet" href="css/main.css">
+<!-- styles moved to css/main.css -->
+<style>
+/* ── Mini confirm dialog ─────────────────────────────────────────────────── */
+.mini-dialog-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgb(0 0 0 / 0.3);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  z-index: 300;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  animation: leave-modal-fade 0.15s ease;
+}
+.mini-dialog-backdrop.open { display: flex; }
+.mini-dialog {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 24px 22px 18px;
+  width: 100%;
+  max-width: 300px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: var(--shadow-md), 0 16px 48px rgb(0 0 0 / 0.14);
+  animation: leave-modal-up 0.18s cubic-bezier(0.34, 1.3, 0.64, 1);
+}
+.mini-dialog-icon {
+  width: 36px; height: 36px;
+  border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  margin-bottom: 2px;
+}
+.mini-dialog-icon.warn { background: #fef2f2; border: 1px solid #fecaca; color: var(--error); }
+.mini-dialog-title {
+  font-size: 14px; font-weight: 700; color: var(--text); letter-spacing: -0.2px;
+}
+.mini-dialog-body {
+  font-size: 12px; color: var(--text-3); line-height: 1.6;
+}
+.mini-dialog-actions {
+  display: flex; gap: 6px; margin-top: 4px;
+}
+.mini-dialog-actions .btn { flex: 1; justify-content: center; }
+</style>
+</head>
+<body>
+
+<div id="app">
+
+  <!-- ── Header ─────────────────────────────────────────────── -->
+  <header id="header">
+    <div class="logo" id="logo-btn" role="button" tabindex="0" aria-label="Return to lobby">
+      <img src="assets/logo.png" class="logo-mark" alt="fugue">
+      fugue
+      <span class="logo-sub">/ ephemeral rooms</span>
+    </div>
+    <div id="connection-status">
+      <div class="status-dot" id="status-dot"></div>
+      <span id="status-text">disconnected</span>
+    </div>
+  </header>
+
+  <!-- ── Lobby ──────────────────────────────────────────────── -->
+  <div id="lobby">
+    <div class="lobby-wrap">
+
+        <!-- ── Lobby top-right buttons ──────────────────────────────── -->
+      <div class="lobby-actions-tr">
+        <button class="lobby-tr-btn" id="info-btn" title="What is fugue?">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.8"/>
+            <path d="M12 16v-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+            <circle cx="12" cy="8" r="0.5" fill="currentColor" stroke="currentColor" stroke-width="1.5"/>
+          </svg>
+        </button>
+        <button class="lobby-tr-btn" id="support-btn" title="Support the creator">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M12 21C12 21 3 14.5 3 8.5C3 5.46 5.46 3 8.5 3C10.24 3 11.8 3.85 12 5C12.2 3.85 13.76 3 15.5 3C18.54 3 21 5.46 21 8.5C21 14.5 12 21 12 21Z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- ── Info popover ──────────────────────────────────────────── -->
+      <div class="lobby-popover hidden" id="info-popover">
+        <button class="popover-close" id="info-popover-close">✕</button>
+        <div class="popover-title">What is fugue?</div>
+        <p class="popover-body">
+          fugue creates <strong>ephemeral encrypted rooms</strong> — no accounts, no servers storing your data, no history.<br><br>
+          Type a room name, share it with someone, and chat. Close the tab and everything vanishes: messages, files, identities. <strong>Nothing is retained.</strong><br><br>
+          End-to-end encryption is enabled when you set a shared passphrase. The relay only sees ciphertext.
+        </p>
+        <div class="popover-tags">
+          <span class="badge badge-accent">AES-256-GCM</span>
+          <span class="badge">zero storage</span>
+          <span class="badge">open source</span>
+        </div>
+      </div>
+
+      <!-- ── Support popover ───────────────────────────────────────── -->
+      <div class="lobby-popover hidden" id="support-popover">
+        <button class="popover-close" id="support-popover-close">✕</button>
+        <div class="popover-title">Support the creator</div>
+        <p class="popover-body" style="margin-bottom:12px">fugue is free and open. If it's useful, any gesture helps keep it alive.</p>
+        <div class="support-options">
+
+          <button class="support-option" id="support-coffee">
+            <span class="support-option-icon">☕</span>
+            <span class="support-option-label">Buy me a coffee</span>
+            <svg class="support-option-arrow" width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+
+          <button class="support-option" id="support-crypto-btn">
+            <span class="support-option-icon">🔑</span>
+            <span class="support-option-label">Crypto donation</span>
+            <svg class="support-option-arrow" width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+
+          <div class="support-crypto-addresses hidden" id="support-crypto-addresses">
+            <div class="crypto-row">
+              <span class="crypto-label">BTC</span>
+              <span class="crypto-addr" title="Click to copy" id="crypto-btc">bc1qplaceholderbtcaddress000000000</span>
+            </div>
+            <div class="crypto-row">
+              <span class="crypto-label">ETH</span>
+              <span class="crypto-addr" title="Click to copy" id="crypto-eth">0xPlaceholderEthAddress0000000000</span>
+            </div>
+            <div class="crypto-row">
+              <span class="crypto-label">SOL</span>
+              <span class="crypto-addr" title="Click to copy" id="crypto-sol">PlaceholderSolanaAddress000000000</span>
+            </div>
+          </div>
+
+          <button class="support-option" id="support-thankyou">
+            <span class="support-option-icon">🙏</span>
+            <span class="support-option-label">Just say thank you</span>
+            <svg class="support-option-arrow" width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+
+          <div class="support-thanks-msg hidden" id="support-thanks-msg">
+            <span>🎉 Thank you — it genuinely means a lot.</span>
+          </div>
+
+          <div class="support-comment-wrap">
+            <textarea class="support-comment" id="support-comment" placeholder="Leave a comment or suggestion…" rows="2"></textarea>
+            <button class="btn btn-primary" id="support-comment-send" style="width:100%;justify-content:center;font-size:12px;padding:6px 10px;">Send</button>
+            <div class="support-comment-sent hidden" id="support-comment-sent">✓ Received — thanks!</div>
+          </div>
+
+        </div>
+      </div>
+
+    <div class="lobby-hero">
+        <h1>Open a room</h1>
+        <p>Type a room name. Anyone with the same name on the same relay meets here. Close the tab — it never existed.</p>
+      </div>
+
+      <div class="lobby-card">
+        <div class="lobby-fields">
+
+          <div class="field">
+            <label class="field-label">Room name</label>
+            <div class="field-row">
+              <input type="text" id="canal-input" placeholder="e.g. cobalt-river-42"
+                     autocomplete="off" spellcheck="false" autocapitalize="none">
+              <div class="fav-wrap">
+                <button class="btn-icon" id="fav-btn" title="Favorites">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                </button>
+                <!-- ── Favorites popover ── -->
+                <div class="fav-popover hidden" id="fav-popover">
+                  <div class="fav-header">
+                    <span class="fav-title">Favorites</span>
+                    <button class="popover-close" id="fav-close">✕</button>
+                  </div>
+                  <!-- setup view -->
+                  <div id="fav-view-setup">
+                    <p class="fav-note">Set a password to encrypt your favorites locally.</p>
+                    <div class="fav-fields">
+                      <input type="password" id="fav-setup-pw" placeholder="Password" autocomplete="new-password">
+                      <input type="password" id="fav-setup-pw2" placeholder="Confirm password" autocomplete="new-password">
+                      <div class="fav-error hidden" id="fav-setup-err"></div>
+                      <button class="btn btn-primary fav-full-btn" id="fav-setup-btn">Set password</button>
+                    </div>
+                  </div>
+                  <!-- unlock view -->
+                  <div id="fav-view-unlock" class="hidden">
+                    <p class="fav-note">Enter your favorites password.</p>
+                    <div class="fav-fields">
+                      <input type="password" id="fav-unlock-pw" placeholder="Password" autocomplete="current-password">
+                      <div class="fav-error hidden" id="fav-unlock-err"></div>
+                      <button class="btn btn-primary fav-full-btn" id="fav-unlock-btn">Unlock</button>
+                      <button class="btn btn-ghost fav-full-btn" id="fav-reset-btn">Forgot password — reset favorites</button>
+                    </div>
+                  </div>
+                  <!-- main view -->
+                  <div id="fav-view-main" class="hidden">
+                    <div class="fav-list" id="fav-list"></div>
+                    <div class="fav-add-row">
+                      <button class="btn btn-ghost fav-half-btn" id="fav-add-btn">
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+                        Save current
+                      </button>
+                      <button class="btn btn-ghost fav-half-btn" id="fav-new-btn">
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+                        New
+                      </button>
+                    </div>
+                    <div class="fav-default-banner hidden" id="fav-default-banner"></div>
+                    <div class="fav-footer-note">Stored locally · encrypted with your password</div>
+                  </div>
+                  <!-- new favorite view -->
+                  <div id="fav-view-new" class="hidden">
+                    <p class="fav-note">Add a new favorite</p>
+                    <div class="fav-fields">
+                      <input type="text" id="fav-new-name" placeholder="Room name" autocomplete="off" spellcheck="false" autocapitalize="none">
+                      <input type="password" id="fav-new-pw" placeholder="Passphrase (optional)" autocomplete="off">
+                      <div class="fav-error hidden" id="fav-new-err"></div>
+                      <div class="fav-fields-row">
+                        <button class="btn btn-ghost fav-half-btn" id="fav-new-cancel">Cancel</button>
+                        <button class="btn btn-primary fav-half-btn" id="fav-new-save">Add</button>
+                      </div>
+                    </div>
+                  </div>
+                  <!-- edit view -->
+                  <div id="fav-view-edit" class="hidden">
+                    <p class="fav-note">Edit favorite</p>
+                    <div class="fav-fields">
+                      <input type="text" id="fav-edit-name" placeholder="Room name" autocomplete="off" spellcheck="false" autocapitalize="none">
+                      <input type="password" id="fav-edit-pw" placeholder="Passphrase (optional)" autocomplete="off">
+                      <div class="fav-fields-row">
+                        <button class="btn btn-ghost fav-half-btn" id="fav-edit-cancel">Cancel</button>
+                        <button class="btn btn-primary fav-half-btn" id="fav-edit-save">Save</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <button class="btn-icon" id="random-canal-btn" title="Generate random name">⟳</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="field-label">
+              Passphrase
+              <span class="field-note">— optional, enables E2E encryption</span>
+            </label>
+            <div class="field-row">
+              <input type="password" id="passphrase-input" placeholder="Leave empty for plaintext">
+              <button class="btn-icon" id="random-pass-btn" title="Generate random passphrase">🎲</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="field-label">
+              Your name
+              <span class="field-note">— optional</span>
+            </label>
+            <input type="text" id="identity-input" placeholder="Auto-assigned if empty" autocomplete="off">
+          </div>
+
+          <button class="btn btn-primary" id="join-btn" style="width:100%;justify-content:center;padding:9px 13px;font-size:14px">
+            Enter room →
+          </button>
+        </div>
+
+        <div class="lobby-divider"></div>
+
+        <div class="lobby-advanced">
+          <div class="field">
+            <label class="field-label">Relay URL</label>
+            <input type="text" id="relay-input" placeholder="wss://..." autocomplete="off" spellcheck="false">
+          </div>
+        </div>
+
+        <div class="lobby-footer">
+          <span class="badge badge-accent" id="badge-cipher">AES-256-GCM</span>
+          <span class="badge" id="badge-kdf">PBKDF2-SHA-256</span>
+          <span class="badge">WebRTC</span>
+          <span class="lobby-footer-note">zero storage · ephemeral</span>
+          <div class="settings-wrap" style="margin-left:auto;position:relative;">
+            <button class="btn-icon-only btn" id="settings-btn" title="Settings" style="padding:4px 7px;border-radius:6px;">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.8"/>
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" stroke="currentColor" stroke-width="1.8"/>
+              </svg>
+            </button>
+            <!-- ── Settings popover ── -->
+            <div class="lobby-popover lobby-popover--up hidden" id="settings-popover">
+              <button class="popover-close" id="settings-popover-close">&#x2715;</button>
+              <div class="popover-title">Encryption settings</div>
+              <p class="popover-body" style="margin-bottom:14px">
+                Peers must use the <strong>same settings</strong> to share a room. Different combinations produce cryptographically distinct rooms even with the same passphrase and room name.
+              </p>
+              <div class="settings-row">
+                <div class="settings-field">
+                  <div class="settings-group-label">Cipher</div>
+                  <select class="settings-select" id="cipher-select">
+                    <option value="AES-256-GCM">AES-256-GCM — recommended</option>
+                    <option value="AES-192-GCM">AES-192-GCM — shorter key</option>
+                    <option value="AES-256-CBC">AES-256-CBC — legacy</option>
+                    <option value="ChaCha20-Poly1305" disabled>ChaCha20-Poly1305 — coming soon</option>
+                    <option value="XChaCha20-Poly1305" disabled>XChaCha20-Poly1305 — coming soon</option>
+                  </select>
+                </div>
+                <div class="settings-field">
+                  <div class="settings-group-label">Key derivation</div>
+                  <select class="settings-select" id="kdf-select">
+                    <option value="PBKDF2-SHA-256">PBKDF2-SHA-256 — recommended</option>
+                    <option value="PBKDF2-SHA-512">PBKDF2-SHA-512 — stronger hash</option>
+                    <option value="HKDF-SHA-384">HKDF-SHA-384 — no stretching</option>
+                    <option value="HKDF-SHA-512">HKDF-SHA-512 — no stretching</option>
+                    <option value="scrypt" disabled>scrypt — coming soon</option>
+                  </select>
+                </div>
+              </div>
+              <button class="btn btn-ghost" id="settings-reset-btn" style="margin-top:16px;width:100%;justify-content:center;font-size:12px;">
+                Reset to defaults
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── Room ───────────────────────────────────────────────── -->
+  <div id="room">
+
+    <!-- Left: peers -->
+    <div id="peers-panel" class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Peers</span>
+        <span id="peer-count" class="badge">0</span>
+        <button class="panel-toggle-btn" id="peers-toggle-btn" aria-label="Collapse peers panel">
+          <svg class="toggle-icon toggle-icon-collapse" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M10 3L5 8L10 13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <svg class="toggle-icon toggle-icon-expand" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M6 3L11 8L6 13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="panel-body" id="peer-list"></div>
+      <div class="room-info">
+        <div class="room-label">Room</div>
+        <div class="room-name" id="room-canal"></div>
+        <div class="room-relay" id="room-relay"></div>
+        <div class="room-actions">
+          <button class="btn btn-ghost btn-icon-only" id="copy-link-btn" title="Copy link">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+          <button class="btn btn-ghost btn-icon-only" id="show-qr-btn" title="Show QR code">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <rect x="3" y="3" width="7" height="7" rx="1" stroke="currentColor" stroke-width="1.8"/>
+              <rect x="14" y="3" width="7" height="7" rx="1" stroke="currentColor" stroke-width="1.8"/>
+              <rect x="3" y="14" width="7" height="7" rx="1" stroke="currentColor" stroke-width="1.8"/>
+              <rect x="5" y="5" width="3" height="3" fill="currentColor"/>
+              <rect x="16" y="5" width="3" height="3" fill="currentColor"/>
+              <rect x="5" y="16" width="3" height="3" fill="currentColor"/>
+              <path d="M14 14h3v3h-3zM17 17h3v3h-3zM14 20h3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+          <button class="btn btn-danger" id="leave-btn">leave</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Center: chat -->
+    <div id="chat-panel">
+      <div id="messages"></div>
+      <div id="input-bar">
+        <label class="attach-btn" for="file-input" title="Attach file">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </label>
+        <input type="file" id="file-input" class="hidden" multiple>
+        <textarea id="msg-input" placeholder="Enter to send" rows="1"></textarea>
+        <button class="btn btn-primary" id="send-btn">Send</button>
+      </div>
+      <div id="enc-bar">
+        <span id="enc-icon">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="3" y="11" width="18" height="11" rx="2" ry="2" stroke="currentColor" stroke-width="1.8"/>
+            <path d="M7 11V7a5 5 0 0 1 10 0v4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          </svg>
+        </span>
+        <span id="enc-label" class="enc-label enc-off">plaintext · no passphrase</span>
+        <button class="btn-meta-toggle" id="meta-toggle-btn" title="Show names &amp; timestamps">
+          <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="8" cy="5" r="2.2" stroke="currentColor" stroke-width="1.4"/>
+            <path d="M3 13c0-2.76 2.24-5 5-5s5 2.24 5 5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Right: files -->
+    <div id="files-panel" class="panel">
+      <div class="panel-header">
+        <button class="panel-toggle-btn" id="files-toggle-btn" aria-label="Collapse files panel">
+          <svg class="toggle-icon toggle-icon-collapse" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M6 3L11 8L6 13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <svg class="toggle-icon toggle-icon-expand" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M10 3L5 8L10 13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <span id="file-count" class="badge">0</span>
+        <span class="panel-title">Files</span>
+      </div>
+      <div class="panel-body" id="file-list"></div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ── Leave Room Modal ──────────────────────────────────────────────── -->
+<div id="leave-modal">
+  <div class="leave-modal-box">
+    <div class="leave-modal-icon">
+      <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        <polyline points="16 17 21 12 16 7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        <line x1="21" y1="12" x2="9" y2="12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </div>
+    <div class="leave-modal-title">Leave this room?</div>
+    <p class="leave-modal-body">
+      This room is ephemeral. Once you leave, all messages and files shared here
+      <strong>vanish permanently</strong> — there is no history, no recovery.
+    </p>
+    <div class="leave-modal-actions">
+      <button class="btn btn-outline" id="leave-modal-cancel">Stay</button>
+      <button class="btn leave-modal-confirm" id="leave-modal-confirm">Leave &amp; forget</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── QR Modal ───────────────────────────────────────────── -->
+<div id="qr-modal">
+  <div class="modal-box">
+    <div class="modal-title">Scan to join</div>
+    <div id="qr-canvas"></div>
+    <div class="modal-canal" id="qr-canal"></div>
+    <label id="qr-key-toggle" class="qr-toggle hidden">
+      <input type="checkbox" id="qr-include-key">
+      Embed passphrase in QR
+    </label>
+    <p class="modal-note" id="qr-note"></p>
+    <button class="btn btn-outline" id="close-qr-btn" style="width:100%;justify-content:center">Close</button>
+  </div>
+</div>
+
+<script type="module" src="js/panels.js"></script>
+<script type="module" src="js/lobby.js"></script>
+<script type="module" src="js/favorites.js"></script>
+<script type="module" src="js/app.js"></script>
+<script src="js/gestures.js"></script>
+<!-- ── Mini confirm dialogs ──────────────────────────────────────── -->
+<div class="mini-dialog-backdrop" id="fav-reset-dialog">
+  <div class="mini-dialog">
+    <div class="mini-dialog-icon warn">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><line x1="12" y1="9" x2="12" y2="13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><line x1="12" y1="17" x2="12.01" y2="17" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </div>
+    <div class="mini-dialog-title">Reset favorites?</div>
+    <p class="mini-dialog-body">All saved rooms will be permanently deleted. This cannot be undone.</p>
+    <div class="mini-dialog-actions">
+      <button class="btn btn-outline" id="fav-reset-dialog-cancel">Cancel</button>
+      <button class="btn" style="background:var(--error);color:white;border-color:var(--error);" id="fav-reset-dialog-confirm">Reset</button>
+    </div>
+  </div>
+</div>
+
+<div class="mini-dialog-backdrop" id="fav-delete-dialog">
+  <div class="mini-dialog">
+    <div class="mini-dialog-icon warn">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><polyline points="3 6 5 6 21 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 11v6M14 11v6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+    </div>
+    <div class="mini-dialog-title">Delete favorite?</div>
+    <p class="mini-dialog-body">Remove <strong id="fav-delete-name"></strong> from your favorites?</p>
+    <div class="mini-dialog-actions">
+      <button class="btn btn-outline" id="fav-delete-dialog-cancel">Cancel</button>
+      <button class="btn" style="background:var(--error);color:white;border-color:var(--error);" id="fav-delete-dialog-confirm">Delete</button>
+    </div>
+  </div>
+</div>
+</body>
+</html>
