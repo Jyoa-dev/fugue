@@ -12,6 +12,13 @@ const ENC = new TextEncoder();
 
 const _keys = new Map(); // id → CryptoKey
 
+let _argon2Ready = false;
+async function _loadArgon2() {
+  if (_argon2Ready) return;
+  importScripts('../lib/argon2-bundled.min.js');  // sets self.argon2; wasm loaded from same dir
+  _argon2Ready = true;
+}
+
 // ── Algorithm registry ───────────────────────────────────────────────────
 // Maps UI setting identifiers to parameters.
 // WebCrypto ciphers (AES-*) use the WebCrypto API.
@@ -37,6 +44,7 @@ const KDF_HASH = {
   // scrypt: memory-hard KDF — no PBKDF2 pre-stretch needed, scrypt does the work.
   // N=2^17 (131072), r=8, p=1 → ~64 MB RAM, ~1-2 s on a mid-range device.
   'scrypt':         { type: 'scrypt', N: 131072, r: 8, p: 1, dkLen: 32 },
+  'Argon2id': { type: 'argon2id', t: 3, m: 65536, p: 4, dkLen: 32 },
 };
 
 const DEFAULT_SETTINGS = { cipher: 'AES-256-GCM', kdf: 'PBKDF2-SHA-256' };
@@ -60,7 +68,19 @@ async function deriveKey(passphrase, salt, settings = {}) {
 
   let stretchedRaw;
 
-  if (kdfSpec.type === 'scrypt') {
+  if (kdfSpec.type === 'argon2id') {
+    await _loadArgon2();
+    const result = await self.argon2.hash({
+      pass:        passphrase,
+      salt:        saltBytes,
+      type:        self.argon2.ArgonType.Argon2id,
+      time:        kdfSpec.t,
+      mem:         kdfSpec.m,
+      parallelism: kdfSpec.p,
+      hashLen:     kdfSpec.dkLen,
+    });
+    stretchedRaw = result.hash; // Uint8Array[32] → continues to HKDF below
+  } else if (kdfSpec.type === 'scrypt') {
     // scrypt is already memory-hard — one step is sufficient.
     // Output is 32 bytes used directly as HKDF input material.
     stretchedRaw = scrypt(

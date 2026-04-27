@@ -7,7 +7,7 @@ import {
   estimateWebPSize, compressImageWebP,
   estimateAVIFSize, compressImageAVIF,
   estimateJPEGSize, compressImageJPEG,
-  isVideoEligible, compressVideoH264, terminateFFmpeg,
+  isVideoEligible, compressVideoH264,
 } from './compress.js';
 
 const App = (() => {
@@ -136,13 +136,10 @@ const App = (() => {
           });
         };
 
-        // AVIF first (best compression) — use local encoding check, not the
-        // imported isAVIFSupported() which tests decoding, not canvas encoding
-        _checkAVIFEncoding().then(supported => {
-          if (supported) addImgBtn('Compress to AVIF', estimateAVIFSize, 'avif');
-        });
+        // AVIF first (best compression) — always offered, browser will error if unsupported
+        addImgBtn('Compress to AVIF', estimateAVIFSize, 'avif');
         addImgBtn('Compress to WebP', estimateWebPSize, 'webp');
-        addImgBtn('Compress to JPEG  (universal)', estimateJPEGSize, 'jpeg');
+        addImgBtn('Compress to JPEG', estimateJPEGSize, 'jpeg');
       } else {
         const btnH264 = document.createElement('button');
         btnH264.className   = 'btn btn-primary';
@@ -172,11 +169,12 @@ const App = (() => {
 
       stopBtn.textContent = '✕ Stop encoding';
       stopBtn.disabled    = false;
+      const abortCtrl = new AbortController();
       stopBtn.onclick     = () => {
         stopBtn.textContent = 'Stopping…';
         stopBtn.disabled    = true;
         modal._stopped      = true;
-        terminateFFmpeg();
+        abortCtrl.abort();
       };
       modal._stopped = false;
 
@@ -198,8 +196,9 @@ const App = (() => {
           compressed           = await compressImageJPEG(file);
           progFill.style.width = '100%';
         } else {
-          progLbl.textContent = 'Loading encoder… (first use fetches ~31 MB from your server)';
+          progLbl.textContent = 'Loading encoder… (~31 MB)';
           compressed = await compressVideoH264(file, {
+            signal:     abortCtrl.signal,
             onProgress: p => {
               progLbl.textContent  = `Encoding… ${Math.round(p * 100)}%`;
               progFill.style.width = `${Math.round(p * 100)}%`;
@@ -249,10 +248,28 @@ const App = (() => {
           continue;
         }
 
-        // Unexpected error — fall back silently
+        // Unexpected error — show in modal, let user decide
         console.error('[compress] compression failed:', e);
+        modal._compressing   = false;
+        progFill.style.width = '0%';
+        progLbl.style.color  = 'var(--danger, #e55)';
+        progLbl.textContent  = `⚠ ${e.message}`;
+
+        const result = await new Promise(resolve => {
+          stopBtn.className   = 'btn btn-outline';
+          stopBtn.textContent = `Send as-is  (${_fmtSize(file.size)})`;
+          stopBtn.disabled    = false;
+          stopBtn.onclick     = () => resolve('raw');
+
+          const btnCancel = document.createElement('button');
+          btnCancel.className   = 'btn btn-outline';
+          btnCancel.textContent = 'Cancel';
+          btnCancel.onclick     = () => resolve(null);
+          stopBtn.insertAdjacentElement('afterend', btnCancel);
+        });
+
         _closeCompressModal();
-        return file;
+        return result === 'raw' ? file : null;
       }
     }
   }
@@ -329,7 +346,7 @@ const App = (() => {
     const unicode = '£€¥©®°±×÷≠≈≤≥∞√←→↑↓§¶µ¿¡';   // KeePass "high" set
     const sets    = [lower, upper, digits, special, unicode];
     const all     = sets.join('');
-    const length  = 32;
+    const length  = 48;
     const result  = [];
     // Guarantee ≥2 chars from every set
     for (const set of sets) {
@@ -352,15 +369,16 @@ const App = (() => {
   // not encoding. OffscreenCanvas.convertToBlob is the correct encoding API.
   async function _checkAVIFEncoding() {
     try {
-      if (typeof OffscreenCanvas !== 'undefined') {
-        const oc   = new OffscreenCanvas(1, 1);
-        const blob = await oc.convertToBlob({ type: 'image/avif' });
-        return blob?.type === 'image/avif' && blob.size > 0;
-      }
-      // Fallback for browsers without OffscreenCanvas
+      // Always use HTMLCanvasElement.toBlob — OffscreenCanvas.convertToBlob silently
+      // falls back to PNG in Chrome/Edge even when AVIF encoding is supported.
       const c = document.createElement('canvas');
       c.width = c.height = 1;
-      return c.toDataURL('image/avif').startsWith('data:image/avif');
+      const ctx = c.getContext('2d');
+      ctx.fillStyle = '#f00';
+      ctx.fillRect(0, 0, 1, 1);
+      return await new Promise(resolve =>
+        c.toBlob(b => resolve(!!b && b.type === 'image/avif' && b.size > 0), 'image/avif')
+      );
     } catch { return false; }
   }
 
@@ -382,7 +400,8 @@ const App = (() => {
 
   function initLobby() {
     prefill();
-
+    if (parseHash().canal) joinRoom().catch(console.error);
+    
     window.addEventListener('beforeunload', e => {
       if (!room) return;
       e.preventDefault();

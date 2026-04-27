@@ -1,0 +1,15 @@
+# Cloudflare Pages response headers
+# Cross-origin isolation is required for SharedArrayBuffer (used by some WebCodecs
+# implementations internally). Also hardens the app against clickjacking and sniffing.
+
+/*
+  # Cross-origin isolation
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+  Cross-Origin-Resource-Policy: same-origin
+
+  # Standard security headers
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()

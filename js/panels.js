@@ -50,7 +50,8 @@ window.addEventListener('resize', () => {
 document.addEventListener('click', e => {
   if (e.target.closest('#peers-panel') || e.target.closest('#files-panel')) return;
   if (e.target.closest('.file-bubble')) return;
-  if (e.target.closest('#messages')) return;
+  if (e.target.closest('#messages') && e.target.id !== 'messages') return;
+  if (e.target.closest('#msg-input') || e.target.closest('#send-btn') || e.target.closest('.attach-btn')) return;
   panelRefs.forEach(({ panel, btn }) => {
     if (!panel.classList.contains('collapsed')) setCollapsed(panel, btn, true, true);
   });

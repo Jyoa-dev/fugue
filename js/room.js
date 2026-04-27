@@ -89,7 +89,7 @@ function decodeDCFrame(buffer) {
 // ── CryptoWorker + Pool ──────────────────────────────────────────────────
 class CryptoWorker {
   constructor() {
-    this._w       = new Worker(new URL('./crypto.js', import.meta.url), { type: 'module' });
+    this._w       = new Worker(new URL('./crypto.js', import.meta.url))
     this._pending = new Map();
     this._seq     = 0;
     this._keyId   = null;

@@ -6,15 +6,31 @@
 //     compressGzip(blob)                     → Promise<Blob>
 //     decompressGzip(blob, mimeType)         → Promise<Blob>
 //
-//   Lossy image (opt-in, WebP via OffscreenCanvas):
+//   Lossy image (opt-in, WebP/AVIF/JPEG via OffscreenCanvas):
 //     isLossyImageEligible(mimeType, name, size) → bool
-//     estimateWebPSize(file, quality?)           → Promise<number>   (bytes)
+//     estimateWebPSize(file, quality?)           → Promise<number>
 //     compressImageWebP(file, quality?)          → Promise<File>
+//     estimateAVIFSize(file, quality?)           → Promise<number>
+//     compressImageAVIF(file, quality?)          → Promise<File>
+//     estimateJPEGSize(file, quality?)           → Promise<number>
+//     compressImageJPEG(file, quality?)          → Promise<File>
 //
-//   Lossy video (opt-in, H.264 via ffmpeg.wasm — loaded lazily):
-//     isVideoEligible(mimeType, name, size)      → bool
-//     compressVideoH264(file, opts)              → Promise<File>
+//   Lossy video (opt-in, WebCodecs only):
+//     isVideoEligible(mimeType, name, size)  → bool
+//     isWebCodecsSupported()                 → Promise<bool>
+//     compressVideoH264(file, opts)          → Promise<File>
 //       opts: { onProgress(0‥1), onLog(msg) }
+//       throws if WebCodecs unavailable or input format unsupported
+//
+//   VIDEO COMPRESSION STRATEGY
+//   ┌─────────────────────────────────────────────────────────────────────┐
+//   │ WebCodecs only — H.264 hardware encode, zero WASM download         │
+//   │   — Chrome/Edge 94+, requires MP4 / MOV / M4V / WebM input        │
+//   │   — VideoDecoder + VideoEncoder + mp4box demux + mp4-muxer mux    │
+//   │   — AudioDecoder + AudioEncoder for AAC; gracefully drops on err  │
+//   │   — throws a user-readable error when unsupported so callers can   │
+//   │     surface a clear warning in the UI                              │
+//   └─────────────────────────────────────────────────────────────────────┘
 
 
 // ── Lossless: gzip via CompressionStream / DecompressionStream ────────────
@@ -110,9 +126,7 @@ export async function compressImageJPEG(file, quality = 0.85) {
 }
 
 
-// ── Lossy video: H.264 via ffmpeg.wasm (lazy-loaded on first use) ─────────
-// ffmpeg-core.wasm is ~31 MB — downloaded and cached by the browser on
-// first video compression. Subsequent compressions reuse the same instance.
+// ── Lossy video ────────────────────────────────────────────────────────────
 
 const _VIDEO_MIME = /^video\//i;
 const _VIDEO_EXT  = /\.(mp4|mov|avi|mkv|webm|m4v|flv|wmv|3gp|ts)$/i;
@@ -122,87 +136,407 @@ export function isVideoEligible(mimeType = '', name = '', size = 0) {
   return size >= VIDEO_MIN_BYTES && (_VIDEO_MIME.test(mimeType) || _VIDEO_EXT.test(name));
 }
 
-// Singleton ffmpeg instance — loaded once per page session.
-let _ffmpeg     = null;
-let _ffmpegLoad = null; // in-flight load Promise (prevents double-load)
 
-// Terminates the ffmpeg instance mid-encode. The next call to compressVideoH264
-// will reload the WASM (already cached by the browser, so ~instant).
-export function terminateFFmpeg() {
-  if (_ffmpeg) {
-    try { _ffmpeg.terminate(); } catch {}
-    _ffmpeg     = null;
-    _ffmpegLoad = null;
+// ── WebCodecs support detection ────────────────────────────────────────────
+// Checks VideoEncoder H.264 support once and caches the result.
+
+let _webCodecsSupported = null;
+let _h264Codec         = null; // first codec string that passes isConfigSupported
+
+// Chrome can return supported:false for some avc1 profile strings even when
+// H.264 encoding works fine — probe several in priority order.
+const _H264_CANDIDATES = [
+  'avc1.42E01E', // Baseline 3.0
+  'avc1.4D401E', // Main 3.0
+  'avc1.64001E', // High 3.0
+  'avc1.420034', // Baseline 5.2 — broad SW fallback
+];
+
+export async function isWebCodecsSupported() {
+  if (_webCodecsSupported !== null) return _webCodecsSupported;
+  console.log('[compress/webcodecs] checking support…');
+  console.log('[compress/webcodecs] isSecureContext:', typeof isSecureContext !== 'undefined' ? isSecureContext : '(undefined)');
+  console.log('[compress/webcodecs] VideoEncoder:', typeof VideoEncoder);
+  console.log('[compress/webcodecs] VideoDecoder:', typeof VideoDecoder);
+  try {
+    if (typeof VideoEncoder === 'undefined' || typeof VideoDecoder === 'undefined') {
+      console.warn('[compress/webcodecs] VideoEncoder/VideoDecoder not in scope — WebCodecs unsupported');
+      return (_webCodecsSupported = false);
+    }
+    for (const codec of _H264_CANDIDATES) {
+      const result = await VideoEncoder.isConfigSupported({ codec, width: 1280, height: 720 });
+      console.log(`[compress/webcodecs] isConfigSupported(${codec}):`, result.supported);
+      if (result.supported) { _h264Codec = codec; _webCodecsSupported = true; break; }
+    }
+    if (!_webCodecsSupported) _webCodecsSupported = false;
+  } catch (e) {
+    console.warn('[compress/webcodecs] isWebCodecsSupported check threw:', e);
+    _webCodecsSupported = false;
   }
+  console.log('[compress/webcodecs] final supported:', _webCodecsSupported, '| codec:', _h264Codec);
+  return _webCodecsSupported;
 }
 
-async function _getFFmpeg(onLog) {
-  if (_ffmpeg?.loaded) return _ffmpeg;
+// Formats mp4box can demux. Anything outside this list is unsupported —
+// callers receive a thrown error with a user-readable message.
+const _WEBCODECS_EXT = /^(mp4|m4v|mov|webm)$/i;
 
-  if (!_ffmpegLoad) {
-    _ffmpegLoad = (async () => {
-      // Dynamic import so the 31 MB WASM is never fetched unless needed.
-      const { FFmpeg } = await import('../lib/ffmpeg/ffmpeg.js');
-      const ff = new FFmpeg();
-      if (onLog) ff.on('log', ({ message }) => onLog(message));
-      await ff.load({
-        coreURL: new URL('../lib/ffmpeg/ffmpeg-core.js',   import.meta.url).href,
-        wasmURL: new URL('../lib/ffmpeg/ffmpeg-core.wasm', import.meta.url).href,
-      });
-      _ffmpeg     = ff;
-      _ffmpegLoad = null;
-      return ff;
-    })();
-  }
 
-  return _ffmpegLoad;
+// ── WebCodecs internal helpers ─────────────────────────────────────────────
+
+/**
+ * Extract the codec description bytes (avcC / hvcC) from an mp4box track.
+ * These bytes are required by VideoDecoder.configure() for H.264/H.265.
+ * Returns undefined if not found (decoder will try without it).
+ *
+ * @param {object} mp4File   - mp4box file instance
+ * @param {number} trackId
+ * @param {typeof DataStream} DataStream - mp4box DataStream class
+ * @returns {Uint8Array|undefined}
+ */
+function _getVideoDescription(mp4File, trackId, DataStream) {
+  try {
+    const track = mp4File.getTrackById(trackId);
+    for (const entry of track.mdia.minf.stbl.stsd.entries) {
+      const box = entry.avcC ?? entry.hvcC ?? entry.vpcC ?? entry['av1C'];
+      if (!box) continue;
+      const stream = new DataStream(undefined, 0, DataStream.BIG_ENDIAN);
+      box.write(stream);
+      // stream.buffer includes a leading 8-byte box header (4 size + 4 type) — skip it
+      return new Uint8Array(stream.buffer, 8);
+    }
+  } catch { /* description is optional; VideoDecoder will error if truly required */ }
+  return undefined;
 }
 
 /**
- * Compress a video file to H.264 / AAC inside an MP4 container.
- * Uses the "ultrafast" x264 preset + CRF 28 for a good speed/size tradeoff.
- * Downscales to ≤1920×1080 if the source is larger.
+ * WebCodecs compression path.
+ * Demuxes with mp4box, decodes/re-encodes video with VideoDecoder/VideoEncoder,
+ * decodes/re-encodes audio with AudioDecoder/AudioEncoder (AAC), muxes with mp4-muxer.
+ *
+ * Supports MP4 / MOV / M4V / WebM input.
+ * Falls back gracefully: if audio processing fails, output is video-only.
+ *
+ * @param {File}   file
+ * @param {object} opts  { onProgress(0‥1), onLog(msg) }
+ * @returns {Promise<File>}
+ */
+async function _compressVideoWebCodecs(file, { onProgress, onLog, signal } = {}) {
+  const ext = file.name.match(/\.([^.]+)$/)?.[1]?.toLowerCase() ?? '';
+  console.log('[wc] _compressVideoWebCodecs start — file:', file.name, 'ext:', ext, 'size:', file.size);
+  if (!_WEBCODECS_EXT.test(ext)) {
+    throw new Error(`WebCodecs demuxer does not support .${ext}`);
+  }
+
+  // Lazy-load mp4box (demuxer, ~200 KB) + mp4-muxer (muxer, ~30 KB).
+  // Neither is fetched unless this path is actually taken.
+  console.log('[wc] importing mp4box + mp4-muxer…');
+  const [mp4boxMod, { Muxer, ArrayBufferTarget }] = await Promise.all([
+    import('mp4box'),
+    import('mp4-muxer'),
+  ]);
+  console.log('[wc] imports done');
+  const MP4Box     = mp4boxMod.default ?? mp4boxMod;
+  const DataStream = MP4Box.DataStream;
+
+  console.log('[wc] reading arrayBuffer…');
+  const ab = await file.arrayBuffer();
+  console.log('[wc] arrayBuffer ready, byteLength:', ab.byteLength);
+
+  return new Promise((resolve, reject) => {
+    const mp4In = MP4Box.createFile();
+
+    // Muxer / encoders are created once track info is available in onReady.
+    let muxer          = null;
+    let muxTarget      = null;
+    let videoEncoder   = null;
+    let videoDecoder   = null;
+    let audioEncoder   = null;
+    let audioDecoder   = null;
+
+    let videoTrackId = null;
+    let audioTrackId = null;
+
+    let totalVideoSamples    = 0;
+    let videoSamplesReceived = 0;
+    let totalAudioSamples    = 0;
+    let audioSamplesReceived = 0;
+
+    let videoDone  = false;
+    let audioDone  = false;
+    let finalized  = false;
+
+    // ── Abort handler — the REAL stop fix ─────────────────────────────────
+    // mp4box dispatches all samples at once from the in-memory buffer, so
+    // checking signal.aborted inside onSamples is always too late. The only
+    // reliable fix is to forcibly close the codecs the instant abort fires:
+    // .close() drains their internal queues synchronously and stops any
+    // further output callbacks, ending the pipeline immediately.
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        if (finalized) return;
+        finalized = true;          // prevent _finalize() from winning the race
+        try { mp4In.stop?.(); }    catch {}
+        try { videoDecoder?.close(); } catch {}
+        try { videoEncoder?.close(); } catch {}
+        try { audioDecoder?.close(); } catch {}
+        try { audioEncoder?.close(); } catch {}
+        reject(new DOMException('Encoding aborted', 'AbortError'));
+      }, { once: true });
+    }
+
+    function _finalize() {
+      console.log('[wc] _finalize called, finalized:', finalized);
+      if (finalized) return;   // abort handler may have already rejected
+      finalized = true;
+      try {
+        muxer.finalize();
+        const blob = new Blob([muxTarget.buffer], { type: 'video/mp4' });
+        console.log('[wc] muxer finalized, output size:', blob.size);
+        resolve(new File([blob], file.name.replace(/\.[^.]+$/, '.mp4'), { type: 'video/mp4' }));
+      } catch (err) {
+        console.error('[wc] _finalize error:', err);
+        reject(err);
+      }
+    }
+
+    function _checkDone() {
+      console.log('[wc] _checkDone — videoDone:', videoDone, 'audioDone:', audioDone);
+      if (videoDone && audioDone) _finalize();
+    }
+
+    mp4In.onReady = (info) => {
+      console.log('[wc] onReady — tracks:', info.tracks?.length, 'video:', info.videoTracks?.length, 'audio:', info.audioTracks?.length);
+      try {
+        const vTrack = info.videoTracks?.[0];
+        if (!vTrack) { console.error('[wc] no video track'); reject(new Error('No video track found in file')); return; }
+
+        const aTrack = info.audioTracks?.[0];
+
+        videoTrackId      = vTrack.id;
+        totalVideoSamples = vTrack.nb_samples;
+
+        // ── output dimensions (downscale to ≤1920×1080, keep even) ───────
+        const srcW  = vTrack.video.width;
+        const srcH  = vTrack.video.height;
+        const scale = Math.min(1, 1920 / srcW, 1080 / srcH);
+        const outW  = Math.floor(srcW * scale / 2) * 2;
+        const outH  = Math.floor(srcH * scale / 2) * 2;
+        const fps   = Math.round(
+          vTrack.nb_samples / (vTrack.duration / vTrack.timescale)
+        ) || 30;
+
+        onLog?.(`[compress/webcodecs] ${srcW}×${srcH} → ${outW}×${outH} @ ${fps} fps, codec=${vTrack.codec}`);
+
+        // ── muxer ─────────────────────────────────────────────────────────
+        muxTarget = new ArrayBufferTarget();
+        const muxerOpts = {
+          target:                 muxTarget,
+          video:                  { codec: 'avc', width: outW, height: outH },
+          fastStart:              'in-memory',
+          firstTimestampBehavior: 'offset',
+        };
+
+        // ── audio setup ───────────────────────────────────────────────────
+        let audioSampleRate = 44100;
+        let audioChannels   = 2;
+
+        if (aTrack) {
+          audioTrackId      = aTrack.id;
+          audioSampleRate   = aTrack.audio.sample_rate;
+          audioChannels     = aTrack.audio.channel_count;
+          totalAudioSamples = aTrack.nb_samples;
+          muxerOpts.audio   = { codec: 'aac', sampleRate: audioSampleRate, numberOfChannels: audioChannels };
+        } else {
+          audioDone = true; // no audio track — nothing to wait for
+        }
+
+        muxer = new Muxer(muxerOpts);
+
+        // ── video encoder ─────────────────────────────────────────────────
+        let encodedVideoChunks = 0;
+        videoEncoder = new VideoEncoder({
+          output: (chunk, meta) => {
+            muxer.addVideoChunk(chunk, meta);
+            onProgress?.(Math.min(1, ++encodedVideoChunks / totalVideoSamples));
+          },
+          error: (e) => reject(new Error(`VideoEncoder: ${e.message}`)),
+        });
+        videoEncoder.configure({
+          codec:     _h264Codec,
+          width:     outW,
+          height:    outH,
+          bitrate:   2_500_000,
+          framerate: fps,
+        });
+
+        // ── video decoder ─────────────────────────────────────────────────
+        const videoDesc = _getVideoDescription(mp4In, videoTrackId, DataStream);
+        videoDecoder = new VideoDecoder({
+          output: (frame) => {
+            videoEncoder.encode(frame, { keyFrame: videoEncoder.encodeQueueSize === 0 });
+            frame.close();
+          },
+          error: (e) => reject(new Error(`VideoDecoder: ${e.message}`)),
+        });
+        videoDecoder.configure({
+          codec:       vTrack.codec,
+          codedWidth:  srcW,
+          codedHeight: srcH,
+          ...(videoDesc ? { description: videoDesc } : {}),
+        });
+
+        // ── audio encoder/decoder ─────────────────────────────────────────
+        if (aTrack) {
+          // Audio errors are non-fatal: we log and drop the audio track rather
+          // than failing the entire compression.
+          const _onAudioError = (label) => (e) => {
+            onLog?.(`[compress/webcodecs] ${label}: ${e.message} — audio track dropped`);
+            audioDone = true;
+            // Patch muxer to ignore subsequent addAudioChunk calls
+            muxer.addAudioChunk = () => {};
+            _checkDone();
+          };
+
+          audioEncoder = new AudioEncoder({
+            output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+            error:  _onAudioError('AudioEncoder'),
+          });
+
+          try {
+            audioEncoder.configure({
+              codec:            'mp4a.40.2', // AAC-LC
+              sampleRate:       audioSampleRate,
+              numberOfChannels: audioChannels,
+              bitrate:          128_000,
+            });
+          } catch (e) {
+            _onAudioError('AudioEncoder.configure')(e);
+          }
+
+          audioDecoder = new AudioDecoder({
+            output: (data) => { audioEncoder.encode(data); data.close(); },
+            error:  _onAudioError('AudioDecoder'),
+          });
+
+          try {
+            audioDecoder.configure({
+              codec:            aTrack.codec,
+              sampleRate:       audioSampleRate,
+              numberOfChannels: audioChannels,
+            });
+          } catch (e) {
+            _onAudioError('AudioDecoder.configure')(e);
+          }
+        }
+
+        // ── start sample extraction ───────────────────────────────────────
+        mp4In.setExtractionOptions(videoTrackId, 'video', { nbSamples: 100 });
+        if (audioTrackId) mp4In.setExtractionOptions(audioTrackId, 'audio', { nbSamples: 100 });
+        mp4In.start();
+
+      } catch (err) {
+        reject(err);
+      }
+    }; // onReady
+
+    mp4In.onSamples = async (id, user, samples) => {
+      try {
+        // If abort fired, finalized is already true and the codecs are closed.
+        // Any attempt to .decode() a closed codec throws — skip gracefully.
+        if (finalized) return;
+        if (user === 'video') {
+          for (const s of samples) {
+            videoDecoder.decode(new EncodedVideoChunk({
+              type:      s.is_sync ? 'key' : 'delta',
+              timestamp: (s.cts      / s.timescale) * 1e6,
+              duration:  (s.duration / s.timescale) * 1e6,
+              data:      s.data,
+            }));
+          }
+          videoSamplesReceived += samples.length;
+
+          if (videoSamplesReceived >= totalVideoSamples) {
+            await videoDecoder.flush();
+            await videoEncoder.flush();
+            videoDone = true;
+            _checkDone();
+          }
+
+        } else if (user === 'audio' && !audioDone) {
+          for (const s of samples) {
+            audioDecoder.decode(new EncodedAudioChunk({
+              type:      s.is_sync ? 'key' : 'delta',
+              timestamp: (s.cts      / s.timescale) * 1e6,
+              duration:  (s.duration / s.timescale) * 1e6,
+              data:      s.data,
+            }));
+          }
+          audioSamplesReceived += samples.length;
+
+          if (audioSamplesReceived >= totalAudioSamples) {
+            await audioDecoder.flush();
+            await audioEncoder.flush();
+            audioDone = true;
+            _checkDone();
+          }
+        }
+      } catch (err) {
+        reject(err);
+      }
+    }; // onSamples
+
+    mp4In.onError = (err) => reject(new Error(`mp4box: ${err}`));
+
+    // Feed the entire buffer. Slicing ensures mp4box owns the ArrayBuffer.
+    const buf = ab.slice(0);
+    buf.fileStart = 0;
+    mp4In.appendBuffer(buf);
+    mp4In.flush();
+  });
+}
+
+
+// ── Public video API ───────────────────────────────────────────────────────
+
+/**
+ * Compress a video file to H.264 / AAC inside an MP4 container via WebCodecs.
+ * Hardware-accelerated, zero WASM download. Requires Chrome/Edge 94+.
+ *
+ * Throws a user-readable error (suitable for display in UI) when:
+ *   — the browser does not support WebCodecs H.264 encoding
+ *   — the input format cannot be demuxed (AVI, MKV, FLV, WMV, …)
  *
  * @param {File}   file
  * @param {object} opts
- * @param {function(number): void}  [opts.onProgress]  Called with 0‥1 as encoding progresses.
- * @param {function(string): void}  [opts.onLog]       Raw ffmpeg log lines (useful for debugging).
+ * @param {(ratio: number) => void}  [opts.onProgress]  0‥1 as encoding progresses.
+ * @param {(msg: string)   => void}  [opts.onLog]       Status / debug messages.
  * @returns {Promise<File>}
+ * @throws  {Error}  User-readable message if compression is not possible.
  */
-export async function compressVideoH264(file, { onProgress, onLog } = {}) {
-  const ffmpeg = await _getFFmpeg(onLog);
+export async function compressVideoH264(file, opts = {}) {
+  const { onLog } = opts;
 
-  const ext     = file.name.match(/\.([^.]+)$/)?.[1]?.toLowerCase() || 'mp4';
-  const inName  = `in_${Date.now()}.${ext}`;
-  const outName = `out_${Date.now()}.mp4`;
+  const ext         = file.name.match(/\.([^.]+)$/)?.[1]?.toLowerCase() ?? '';
+  const wcSupported = await isWebCodecsSupported();
 
-  await ffmpeg.writeFile(inName, new Uint8Array(await file.arrayBuffer()));
-
-  const progressCb = onProgress ? ({ progress }) => onProgress(Math.min(Math.max(progress, 0), 1)) : null;
-  if (progressCb) ffmpeg.on('progress', progressCb);
-
-  try {
-    await ffmpeg.exec([
-      '-i', inName,
-      '-c:v', 'libx264',
-      '-preset', 'ultrafast',
-      '-crf', '28',
-      '-vf', 'scale=iw*min(1\\,min(1920/iw\\,1080/ih)):ih*min(1\\,min(1920/iw\\,1080/ih)),setsar=1',
-      '-c:a', 'aac',
-      '-b:a', '128k',
-      '-movflags', '+faststart',
-      '-y',
-      outName,
-    ], -1);
-  } finally {
-    if (progressCb) ffmpeg.off('progress', progressCb);
-    await ffmpeg.deleteFile(inName).catch(() => {});
+  if (!wcSupported) {
+    const secureCtx = typeof isSecureContext !== 'undefined' && !isSecureContext;
+    const hint = secureCtx
+      ? 'The page must be served over HTTPS (or localhost) for WebCodecs to be available.'
+      : 'Try Chrome or Edge 94+, and make sure the page is served over HTTPS.';
+    const msg = `Video compression requires WebCodecs (Chrome / Edge 94+). ${hint}`;
+    onLog?.(`[compress] ${msg}`);
+    throw new Error(msg);
   }
 
-  const data    = await ffmpeg.readFile(outName);
-  await ffmpeg.deleteFile(outName).catch(() => {});
+  if (!_WEBCODECS_EXT.test(ext)) {
+    const msg = `.${ext} files cannot be compressed here. `
+              + 'Supported formats: MP4, MOV, M4V, WebM.';
+    onLog?.(`[compress] ${msg}`);
+    throw new Error(msg);
+  }
 
-  const outBlob = new Blob([data.buffer], { type: 'video/mp4' });
-  const outName2 = file.name.replace(/\.[^.]+$/, '.mp4');
-  return new File([outBlob], outName2, { type: 'video/mp4' });
+  onLog?.('[compress] WebCodecs path — hardware-accelerated, no WASM required');
+  return _compressVideoWebCodecs(file, opts);
 }

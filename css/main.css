@@ -299,6 +299,8 @@ label.field-label {
   flex-shrink: 0;
   width: 36px;
   padding: 0;
+  display: inline-flex;
+  align-items: center;
   justify-content: center;
   font-size: 15px;
   background: var(--bg);
@@ -1997,6 +1999,6 @@ label.field-label {
 /* ── Random passphrase button ─────────────────────────────────────────────── */
 #random-pass-btn {
   font-size: 15px;
-  padding: 0 6px;
+  padding: 0;
   flex-shrink: 0;
 }

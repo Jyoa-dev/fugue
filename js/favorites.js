@@ -7,6 +7,47 @@ const LS  = { SALT: 'fav_salt', VERIFY: 'fav_verify', DATA: 'fav_data', DEFAULT:
 let _cryptoKey = null;
 let _editIdx   = null;
 
+const FAV_VERSION = '2';
+const LS_VER     = 'fav_ver';
+const KS_ALIAS   = 'fugue_fav';
+const LS_KS_BLOB = 'fav_ks_blob';
+
+function _hasKeystore() {
+  try { return typeof AndroidBridge !== 'undefined' && AndroidBridge.isKeystoreAvailable() === 'true'; }
+  catch { return false; }
+}
+// UTF-8 password → base64 and back (handles non-ASCII)
+function _pwToB64(pw)  { return btoa(unescape(encodeURIComponent(pw))); }
+function _b64ToPw(b64) { return decodeURIComponent(escape(atob(b64))); }
+
+async function _keystoreSave(password) {
+  if (!_hasKeystore()) return;
+  try {
+    const blob = AndroidBridge.keystoreStore(KS_ALIAS, _pwToB64(password));
+    if (blob) localStorage.setItem(LS_KS_BLOB, blob);
+  } catch (e) { console.warn('[fav] keystore save:', e); }
+}
+
+async function _keystoreUnlock() {
+  if (!_hasKeystore()) return false;
+  const blob = localStorage.getItem(LS_KS_BLOB);
+  if (!blob) return false;
+  try {
+    const b64pw = AndroidBridge.keystoreRetrieve(KS_ALIAS, blob);
+    if (!b64pw) return false;
+    const salt = Uint8Array.from(atob(localStorage.getItem(LS.SALT)), c => c.charCodeAt(0));
+    const key  = await deriveKey(_b64ToPw(b64pw), salt);
+    await aeDecrypt(key, localStorage.getItem(LS.VERIFY));
+    _cryptoKey = key;
+    return true;
+  } catch { return false; }
+}
+
+
+
+
+
+
 // ── Default room (plaintext — no password required) ───────────────────────
 function getDefaultRoom()           { try { return JSON.parse(localStorage.getItem(LS.DEFAULT)); } catch { return null; } }
 function setDefaultRoom(room, pass) { localStorage.setItem(LS.DEFAULT, JSON.stringify({ room, pass: pass || '' })); }
@@ -25,10 +66,18 @@ function err(elId, msg) {
 
 // ── Crypto helpers ────────────────────────────────────────────────────────
 async function deriveKey(password, salt) {
-  const base = await crypto.subtle.importKey('raw', ENC.encode(password), 'PBKDF2', false, ['deriveKey']);
+  // Step 1 — PBKDF2: brute-force resistance
+  const pbBase = await crypto.subtle.importKey('raw', ENC.encode(password), 'PBKDF2', false, ['deriveKey']);
+  const stretched = await crypto.subtle.deriveKey(
+    { name: 'PBKDF2', hash: 'SHA-256', salt, iterations: 400_000 },
+    pbBase, { name: 'HMAC', hash: 'SHA-256', length: 256 }, true, ['sign']
+  );
+  const stretchedRaw = await crypto.subtle.exportKey('raw', stretched);
+  // Step 2 — HKDF: domain separation (fav key ≠ any room key)
+  const hkdfBase = await crypto.subtle.importKey('raw', stretchedRaw, 'HKDF', false, ['deriveKey']);
   return crypto.subtle.deriveKey(
-    { name: 'PBKDF2', hash: 'SHA-256', salt, iterations: 200_000 },
-    base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
+    { name: 'HKDF', hash: 'SHA-256', salt, info: ENC.encode('fugue-fav-v2') },
+    hkdfBase, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
   );
 }
 
@@ -174,6 +223,8 @@ document.getElementById('fav-setup-btn').addEventListener('click', async () => {
   _cryptoKey = await deriveKey(pw, salt);
   localStorage.setItem(LS.VERIFY, await aeEncrypt(_cryptoKey, 'fugue-fav-ok'));
   await saveData([]);
+  localStorage.setItem(LS_VER, FAV_VERSION);
+  await _keystoreSave(pw);
   err('fav-setup-err', '');
   show('fav-view-main');
   renderList();
@@ -188,11 +239,22 @@ document.getElementById('fav-unlock-btn').addEventListener('click', async () => 
     const key = await deriveKey(pw, salt);
     await aeDecrypt(key, localStorage.getItem(LS.VERIFY));
     _cryptoKey = key;
+    localStorage.setItem(LS_VER, FAV_VERSION);
+    await _keystoreSave(pw);
     err('fav-unlock-err', '');
     show('fav-view-main');
     renderList();
-  } catch { err('fav-unlock-err', 'Wrong password'); }
+  } catch {
+    // No fav_ver + has salt = old vault (v1 single-step PBKDF2) — key derivation changed
+    const msg = !localStorage.getItem(LS_VER)
+      ? 'Vault format updated — reset required (your favorites will need to be re-added).'
+      : 'Wrong password';
+    err('fav-unlock-err', msg);
+  }
 });
+
+
+
 document.getElementById('fav-unlock-pw').addEventListener('keydown', e => {
   if (e.key === 'Enter') document.getElementById('fav-unlock-btn').click();
 });
@@ -204,7 +266,8 @@ document.getElementById('fav-reset-btn').addEventListener('click', () => {
   dlg.onclick = e => { if (e.target === dlg) dlg.classList.remove('open'); };
   document.getElementById('fav-reset-dialog-confirm').onclick = () => {
     dlg.classList.remove('open');
-    [LS.SALT, LS.VERIFY, LS.DATA].forEach(k => localStorage.removeItem(k));
+    [LS.SALT, LS.VERIFY, LS.DATA, LS_VER, LS_KS_BLOB].forEach(k => localStorage.removeItem(k));
+    if (_hasKeystore()) try { AndroidBridge.keystoreDelete(KS_ALIAS); } catch {}
     _cryptoKey = null;
     show('fav-view-setup');
   };
@@ -270,7 +333,7 @@ function closeFav() {
 }
 document.getElementById('fav-close').addEventListener('click', closeFav);
 
-document.getElementById('fav-btn').addEventListener('click', e => {
+document.getElementById('fav-btn').addEventListener('click', async e => {
   e.stopPropagation();
   const pop = document.getElementById('fav-popover');
   if (!pop.classList.contains('hidden')) { closeFav(); return; }
@@ -278,13 +341,21 @@ document.getElementById('fav-btn').addEventListener('click', e => {
   if (!localStorage.getItem(LS.SALT)) {
     show('fav-view-setup');
   } else if (!_cryptoKey) {
-    show('fav-view-unlock');
-    document.getElementById('fav-unlock-pw').value = '';
-    err('fav-unlock-err', '');
+    const ksOk = await _keystoreUnlock();
+    if (ksOk) {
+      show('fav-view-main');
+      renderList();
+    } else {
+      show('fav-view-unlock');
+      document.getElementById('fav-unlock-pw').value = '';
+      err('fav-unlock-err', !localStorage.getItem(LS_VER) ? 'Vault format updated — reset required.' : '');
+    }
   } else {
     show('fav-view-main');
     renderList();
   }
+
+  
   pop.classList.remove('hidden');
   const btn  = document.getElementById('fav-btn');
   const rect = btn.getBoundingClientRect();
