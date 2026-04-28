@@ -48,6 +48,7 @@ window.addEventListener('resize', () => {
 });
 
 document.addEventListener('click', e => {
+  if (window.swipeJustHandled) return;
   if (e.target.closest('#peers-panel') || e.target.closest('#files-panel')) return;
   if (e.target.closest('.file-bubble')) return;
   if (e.target.closest('#messages') && e.target.id !== 'messages') return;

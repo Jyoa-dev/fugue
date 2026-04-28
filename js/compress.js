@@ -107,12 +107,131 @@ export async function compressImageWebP(file, quality = 0.82) {
   return new File([blob], file.name.replace(/\.[^.]+$/, '.webp'), { type: 'image/webp' });
 }
 
-// ── AVIF ──────────────────────────────────────────────────────────────────
-export async function estimateAVIFSize(file, quality = 0.72) {
-  return (await _encodeImage(file, 'image/avif', quality)).size;
+// ── AVIF (WASM libavif — proper encoder, same as Squoosh) ─────────────────
+// Requires avif_enc.wasm + avif_enc.js at AVIF_WASM_BASE (default: project root).
+// Download from:
+//   https://unpkg.com/@jsquash/avif@2.1.1/codec/enc/avif_enc.wasm
+//   https://unpkg.com/@jsquash/avif@2.1.1/codec/enc/avif_enc.js
+export const AVIF_WASM_BASE = '/lib/avif/';
+
+// Binary search bounds: jsquash quality is 0-100, lower = smaller file.
+// lo=20 (aggressive floor), hi=65 (ceiling still visually good), 6 iterations.
+const _AVIF_Q_LO    = 20;
+const _AVIF_Q_HI    = 65;
+const _AVIF_ITERS   = 6;
+
+let _avifEncModule = null;
+async function _getAvifModule() {
+  if (_avifEncModule) return _avifEncModule;
+  const { default: factory } = await import(`${AVIF_WASM_BASE}avif_enc.js`);
+  _avifEncModule = await factory({
+    noInitialRun: true,
+    locateFile: (name) => `${AVIF_WASM_BASE}${name}`,
+  });
+  return _avifEncModule;
 }
-export async function compressImageAVIF(file, quality = 0.72) {
-  const blob = await _encodeImage(file, 'image/avif', quality);
+
+// Encode file → AVIF blob using libavif WASM. quality: 0-100, lower = smaller.
+async function _encodeAVIFWasm(file, quality) {
+  const mod = await _getAvifModule();
+  const bmp = await createImageBitmap(file);
+  const canvas = typeof OffscreenCanvas !== 'undefined'
+    ? new OffscreenCanvas(bmp.width, bmp.height)
+    : (() => { const c = document.createElement('canvas'); c.width = bmp.width; c.height = bmp.height; return c; })();
+  canvas.getContext('2d').drawImage(bmp, 0, 0);
+  bmp.close();
+  const imgData = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height);
+  const buf = mod.encode(
+    new Uint8Array(imgData.data.buffer), imgData.width, imgData.height,
+    { quality, qualityAlpha: -1, denoiseLevel: 0, tileColsLog2: 0, tileRowsLog2: 0,
+      speed: 6, subsample: 1, chromaDeltaQ: false, sharpness: 0, tune: 0,
+      enableSharpYUV: false, bitDepth: 8, lossless: false },
+  );
+  if (!buf) throw new Error('AVIF encode failed');
+  return new Blob([buf], { type: 'image/avif' });
+}
+
+// Find the highest quality (best looking) that still beats the original file size.
+// Result is cached per File object — estimate then compress reuses the same search.
+const _avifCache = new WeakMap(); // File → Blob | null
+async function _bestAVIFBlob(file) {
+  if (_avifCache.has(file)) return _avifCache.get(file);
+  let lo = _AVIF_Q_LO, hi = _AVIF_Q_HI, bestBlob = null;
+  for (let i = 0; i < _AVIF_ITERS; i++) {
+    const q    = Math.round((lo + hi) / 2);
+    const blob = await _encodeAVIFWasm(file, q);
+    if (blob.size < file.size) { bestBlob = blob; hi = q; }
+    else                        {                   lo = q; }
+  }
+  _avifCache.set(file, bestBlob);
+  return bestBlob;
+}
+
+// Singleton worker — keeps the WASM module in memory across calls.
+// Terminated (and nulled) on abort so the stop button still works;
+// the next call recreates it and the browser cache makes reload fast.
+let _avifWorker = null;
+function _getAvifWorker() {
+  if (!_avifWorker)
+    _avifWorker = new Worker(new URL('./avif-worker.js', import.meta.url), { type: 'module' });
+  return _avifWorker;
+}
+
+// Runs the binary-search estimation in a Web Worker so the main thread stays
+// fully responsive. worker.terminate() gives instant cancellation even mid-
+// WASM-encode — unlike a flag check which only fires between iterations.
+// On success the result is cached so compressImageAVIF skips re-encoding.
+export function estimateAVIFSize(file, signal, onProgress) {
+  return new Promise(async (resolve, reject) => {
+    if (signal?.aborted) return reject(new DOMException('Aborted', 'AbortError'));
+
+    // Extract pixel data on the main thread (fast, synchronous-ish)
+    const bmp    = await createImageBitmap(file);
+    const canvas = typeof OffscreenCanvas !== 'undefined'
+      ? new OffscreenCanvas(bmp.width, bmp.height)
+      : (() => { const c = document.createElement('canvas'); c.width = bmp.width; c.height = bmp.height; return c; })();
+    canvas.getContext('2d').drawImage(bmp, 0, 0);
+    bmp.close();
+    const imgData = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height);
+
+    if (signal?.aborted) return reject(new DOMException('Aborted', 'AbortError'));
+
+    const worker = _getAvifWorker();
+
+    const abort = () => {
+      worker.terminate();
+      _avifWorker = null; // force fresh worker next time
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+
+    worker.onmessage = ({ data }) => {
+      if (data.progress !== undefined) { onProgress?.(data.progress, data.total); return; }
+      signal?.removeEventListener('abort', abort);
+      worker.onmessage = null;
+      worker.onerror   = null;
+      if (data.error) { reject(new Error(data.error)); return; }
+      const blob = data.bestBuf ? new Blob([data.bestBuf], { type: 'image/avif' }) : null;
+      _avifCache.set(file, blob); // warm cache — compressImageAVIF will reuse this
+      resolve(blob ? blob.size : file.size);
+    };
+    worker.onerror = e => {
+      signal?.removeEventListener('abort', abort);
+      worker.onmessage = null;
+      worker.onerror   = null;
+      reject(new Error(e.message));
+    };
+
+    // Transfer the pixel buffer — zero-copy into the worker
+    worker.postMessage(
+      { width: imgData.width, height: imgData.height, rgba: imgData.data.buffer, fileSize: file.size },
+      [imgData.data.buffer],
+    );
+  });
+}
+export async function compressImageAVIF(file) {
+  const blob = await _bestAVIFBlob(file);
+  if (!blob) return new File([file], file.name, { type: file.type }); // original untouched
   return new File([blob], file.name.replace(/\.[^.]+$/, '.avif'), { type: 'image/avif' });
 }
 
@@ -239,9 +358,21 @@ async function _compressVideoWebCodecs(file, { onProgress, onLog, signal } = {})
   const MP4Box     = mp4boxMod.default ?? mp4boxMod;
   const DataStream = MP4Box.DataStream;
 
-  console.log('[wc] reading arrayBuffer…');
-  const ab = await file.arrayBuffer();
-  console.log('[wc] arrayBuffer ready, byteLength:', ab.byteLength);
+  // Read in 4 MB slices — file.arrayBuffer() on a large content URI stalls
+  // Android WebView's content resolver; sliced reads avoid the hang.
+  console.log('[wc] reading file in chunks…');
+  const ab = await (async () => {
+    const CHUNK = 4 * 1024 * 1024;
+    const out   = new Uint8Array(file.size);
+    let pos = 0;
+    while (pos < file.size) {
+      const buf = await file.slice(pos, pos + CHUNK).arrayBuffer();
+      out.set(new Uint8Array(buf), pos);
+      pos += buf.byteLength;
+    }
+    return out.buffer;
+  })();
+  console.log('[wc] file read complete, byteLength:', ab.byteLength);
 
   return new Promise((resolve, reject) => {
     const mp4In = MP4Box.createFile();

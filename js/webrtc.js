@@ -65,7 +65,12 @@ export class WebRTCMesh extends EventTarget {
   // ── Public API ─────────────────────────────────────────────────────────
 
   async addPeer(peerId) {
-    if (this._pcs.has(peerId)) return;
+    if (this._pcs.has(peerId)) {
+      console.log('[mesh] addPeer called but already exists', peerId.slice(0,8),
+        '| pc state:', this._pcs.get(peerId).connectionState);
+      return;
+    }
+    console.log('[mesh] addPeer', peerId.slice(0,8));
     const pc = this._createPC(peerId);
     if (this.myPeerId > peerId) {
       const dc = pc.createDataChannel('files', { ordered: false });
@@ -80,6 +85,10 @@ export class WebRTCMesh extends EventTarget {
   }
 
   removePeer(peerId) {
+    console.log('[mesh] removePeer', peerId.slice(0,8),
+      '| pc state:', this._pcs.get(peerId)?.connectionState ?? 'none',
+      '| dc state:', this._dcs.get(peerId)?.readyState ?? 'none',
+      '| pool size:', this._xferPool.get(peerId)?.length ?? 0);
     this._pcs.get(peerId)?.close();
     this._pcs.delete(peerId);
     this._dcs.delete(peerId);
@@ -256,12 +265,23 @@ export class WebRTCMesh extends EventTarget {
     };
 
     pc.onconnectionstatechange = () => {
-      console.log('[pc]', peerId, pc.connectionState);
+      console.log('[pc]', peerId.slice(0,8), pc.connectionState,
+        '| ice:', pc.iceConnectionState, '| signal:', pc.signalingState);
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        console.warn('[pc] dispatching peer_failed for', peerId.slice(0,8),
+          '| trigger stack:', new Error().stack.split('\n').slice(1,3).join(' ▸ '));
+        this._lastPeerFailed = this._lastPeerFailed ?? {};
+        const now = Date.now();
+        const last = this._lastPeerFailed[peerId] ?? 0;
+        console.warn('[pc] ms since last peer_failed for this peer:', now - last);
+        this._lastPeerFailed[peerId] = now;
         this.dispatchEvent(new CustomEvent('peer_failed', { detail: { peerId } }));
         this.removePeer(peerId);
       }
     };
+
+    pc.oniceconnectionstatechange = () =>
+      console.log('[ice]', peerId.slice(0,8), pc.iceConnectionState);
 
     return pc;
   }
@@ -345,10 +365,18 @@ export class WebRTCMesh extends EventTarget {
     const high = dc._bufHigh ?? BUF_MIN;
     const t0   = performance.now();
     await new Promise(r => {
+      const onLow = () => { clearTimeout(hangTimer); r(); };
       dc.bufferedAmountLowThreshold = high;
-      dc.addEventListener('bufferedamountlow', r, { once: true });
+      dc.addEventListener('bufferedamountlow', onLow, { once: true });
+      // Log if drain stalls — helps detect the leaked-promise bug on DC close.
+      const hangTimer = setTimeout(() => {
+        console.warn('[drain] bufferedamountlow never fired after 5 s',
+          '| dc:', dc.label, '| state:', dc.readyState,
+          '| buffered:', dc.bufferedAmount, '| high:', high);
+      }, 5_000);
     });
     const elapsed = performance.now() - t0;
+    if (elapsed > 500) console.warn('[drain] slow drain', Math.round(elapsed), 'ms on', dc.label);
     // Fast drain → link can sustain more; grow threshold.
     if (elapsed < 20 && dc._bufHigh < BUF_MAX) {
       dc._bufHigh = Math.min(BUF_MAX, (dc._bufHigh * 1.5) | 0);

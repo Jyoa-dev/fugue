@@ -14,12 +14,57 @@ const App = (() => {
   let room = null;
 
   function getDefaultRelay() {
-    return 'wss://fugue.thebuttonapp-lastonewins.workers.dev';
+    return 'wss://fugue.jyoa-thegreatdeveloper.workers.dev';
   }
 
   function parseHash() {
     const p = new URLSearchParams(location.hash.slice(1));
     return { canal: p.get('canal') || '', key: p.get('key') || '', relay: p.get('relay') || '' };
+  }
+
+  // ── Join spinner ──────────────────────────────────────────────────────
+  function _injectJoinSpinner() {
+    if (document.getElementById('join-spinner')) return;
+    const style = document.createElement('style');
+    style.textContent = `
+      #join-spinner {
+        display: none; position: fixed; inset: 0;
+        background: rgb(250 249 247 / 0.88);
+        backdrop-filter: blur(8px);
+        -webkit-backdrop-filter: blur(8px);
+        z-index: 200;
+        align-items: center; justify-content: center;
+        flex-direction: column; gap: 14px;
+      }
+      #join-spinner.open { display: flex; }
+      @keyframes fugue-spin { to { transform: rotate(360deg); } }
+      #join-spinner-ring {
+        width: 30px; height: 30px;
+        border: 2.5px solid var(--border-2);
+        border-top-color: var(--text);
+        border-radius: 50%;
+        animation: fugue-spin 0.7s linear infinite;
+      }
+      #join-spinner-label {
+        font-size: 12px; font-family: var(--mono);
+        color: var(--text-3); letter-spacing: 0.03em;
+      }
+    `;
+    document.head.appendChild(style);
+    const el = document.createElement('div');
+    el.id = 'join-spinner';
+    el.innerHTML = `<div id="join-spinner-ring"></div><div id="join-spinner-label"></div>`;
+    document.body.appendChild(el);
+  }
+
+  function _showJoinSpinner(label) {
+    _injectJoinSpinner();
+    document.getElementById('join-spinner-label').textContent = label;
+    document.getElementById('join-spinner').classList.add('open');
+  }
+
+  function _hideJoinSpinner() {
+    document.getElementById('join-spinner')?.classList.remove('open');
   }
 
   // ── Compression prompt ────────────────────────────────────────────────
@@ -49,6 +94,14 @@ const App = (() => {
       #cm-progress .progress-bar { margin-top: 0; }
       #cm-actions { display: flex; gap: 8px; margin-top: 12px; }
       #cm-actions .btn { flex: 1; justify-content: center; }
+      .cm-spinner {
+        display: inline-block; width: 11px; height: 11px;
+        border: 1.5px solid currentColor; border-top-color: transparent;
+        border-radius: 50%; opacity: 0.5;
+        animation: fugue-spin 0.7s linear infinite;
+        margin-right: 7px; vertical-align: middle; flex-shrink: 0;
+      }
+      .cm-spinner.done { display: none; }
     `;
     document.head.appendChild(style);
     const m = document.createElement('div');
@@ -121,25 +174,72 @@ const App = (() => {
         // Helper: add one image format button with async size estimate
         const addImgBtn = (label, estimateFn, resolveKey) => {
           const btn = document.createElement('button');
-          btn.className   = 'btn btn-primary';
-          btn.textContent = `${label} — estimating…`;
-          btn.disabled    = true;
-          btn.onclick     = () => resolve(resolveKey);
+          btn.className = 'btn btn-primary';
+          btn.disabled  = true;
+          btn.innerHTML = `<span class="cm-spinner"></span><span class="cm-btn-label">${label} — estimating…</span>`;
+          btn.onclick   = () => resolve(resolveKey);
           options.appendChild(btn);
           estimateFn(file).then(est => {
             const pct = Math.round((1 - est / file.size) * 100);
-            btn.textContent = `${label}  (~${_fmtSize(est)}, −${pct}%)`;
-            btn.disabled    = false;
+            btn.querySelector('.cm-spinner').classList.add('done');
+            btn.querySelector('.cm-btn-label').textContent = `${label}  (~${_fmtSize(est)}, −${pct}%)`;
+            btn.disabled = false;
           }).catch(() => {
-            btn.textContent = `${label}`;
-            btn.disabled    = false;
+            btn.querySelector('.cm-spinner').classList.add('done');
+            btn.querySelector('.cm-btn-label').textContent = label;
+            btn.disabled = false;
           });
         };
 
-        // AVIF first (best compression) — always offered, browser will error if unsupported
-        addImgBtn('Compress to AVIF', estimateAVIFSize, 'avif');
+        // Fast estimators run automatically; AVIF (WASM) is on-demand.
         addImgBtn('Compress to WebP', estimateWebPSize, 'webp');
         addImgBtn('Compress to JPEG', estimateJPEGSize, 'jpeg');
+
+        // AVIF — manual trigger (binary-search WASM, can be slow)
+        const avifBtn = document.createElement('button');
+        avifBtn.className   = 'btn btn-primary';
+        avifBtn.textContent = 'Compress to AVIF  (click to estimate — slow)';
+        let avifEstAbort = null;
+        avifBtn.onclick = async () => {
+          if (avifEstAbort) return; // already running — ignore extra clicks
+          if (avifBtn.dataset.estimated) { resolve('avif'); return; }
+          // Start estimation
+          avifEstAbort = new AbortController();
+          avifBtn.disabled = true;
+          avifBtn.innerHTML = `<span class="cm-spinner"></span><span class="cm-btn-label">Estimating AVIF…</span>`;
+          avifStopRow.style.display = 'flex';
+          try {
+            const est = await estimateAVIFSize(file, avifEstAbort.signal, (i, total) => {
+              avifBtn.querySelector('.cm-btn-label').textContent = i === 0
+                ? 'Loading AVIF encoder…'
+                : `Estimating AVIF… ${i} / ${total}`;
+            });
+            const pct = Math.round((1 - est / file.size) * 100);
+            avifBtn.querySelector('.cm-spinner').classList.add('done');
+            avifBtn.querySelector('.cm-btn-label').textContent = `Compress to AVIF  (~${_fmtSize(est)}, −${pct}%)`;
+            avifBtn.dataset.estimated = '1';
+            avifBtn.disabled = false;
+          } catch (e) {
+            avifBtn.innerHTML = e.name === 'AbortError'
+              ? 'Compress to AVIF  (click to estimate — slow)'
+              : 'Compress to AVIF';
+            avifBtn.disabled = false;
+          } finally {
+            avifEstAbort = null;
+            avifStopRow.style.display = 'none';
+          }
+        };
+        options.appendChild(avifBtn);
+
+        const avifStopRow = document.createElement('div');
+        avifStopRow.style.cssText = 'display:none;justify-content:center;margin-top:-2px';
+        const avifStopLink = document.createElement('button');
+        avifStopLink.className   = 'btn btn-outline';
+        avifStopLink.style.cssText = 'font-size:11px;padding:4px 10px';
+        avifStopLink.textContent = '✕ Stop AVIF estimation';
+        avifStopLink.onclick     = () => avifEstAbort?.abort();
+        avifStopRow.appendChild(avifStopLink);
+        options.appendChild(avifStopRow);
       } else {
         const btnH264 = document.createElement('button');
         btnH264.className   = 'btn btn-primary';
@@ -482,14 +582,18 @@ const App = (() => {
       );
     }
 
+    _showJoinSpinner(passphrase ? 'deriving key…' : 'connecting…');
     try {
       await room.init();
     } catch (err) {
       console.error('[fugue] room.init() failed:', err);
+      _hideJoinSpinner();
       UI.setStatus('error', 'error');
       room?.leave?.();
       room = null;
       return;
+    } finally {
+      _hideJoinSpinner();
     }
 
     history.pushState({ fugueRoom: true }, '');
