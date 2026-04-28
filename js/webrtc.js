@@ -50,6 +50,9 @@ export class WebRTCMesh extends EventTarget {
     super();
     this.sendSignal    = sendSignal;
     this.myPeerId      = myPeerId;
+    // Expose this instance's diag helper globally so DevTools can call:
+    //   window._webrtcMesh.xferStats()
+    window._webrtcMesh = this;
     /** @type {Map<string, RTCPeerConnection>} */
     this._pcs          = new Map();
     /** @type {Map<string, RTCDataChannel>} */
@@ -72,6 +75,37 @@ export class WebRTCMesh extends EventTarget {
     // concurrent sendOnChannel calls on different DCs overlap instead of serialising.
     /** @type {WeakMap<RTCDataChannel, { pending: Array<{buffer:ArrayBuffer, resolve:()=>void}>, running:boolean }>} */
     this._writeQueues     = new WeakMap();
+    // ── Diagnostics (call mesh.xferStats() in console to read) ──────────────
+    this._xferDiag = {
+      calls:        0,    // total sendOnChannel calls
+      queueWaitMs:  0,    // total ms sendOnChannel blocked waiting for dequeue
+      drainCount:   0,    // total times _drainBuffer was entered
+      drainMs:      0,    // total ms spent in _drainBuffer
+      bytesSent:    0,    // payload bytes passed to dc.send()
+      concurrentDrains: 0, // channels draining simultaneously right now
+      peakConcurrent:   0,
+      startedAt:    performance.now(),
+    };
+  }
+
+  // Call in DevTools: mesh.xferStats()
+  xferStats() {
+    const d = this._xferDiag;
+    const elapsed = ((performance.now() - d.startedAt) / 1000).toFixed(1);
+    const mbps    = ((d.bytesSent * 8) / 1e6 / (elapsed || 1)).toFixed(2);
+    const avgDrain = d.drainCount ? (d.drainMs / d.drainCount).toFixed(0) : '-';
+    const avgQueue = d.calls      ? (d.queueWaitMs / d.calls).toFixed(1)  : '-';
+    console.table({
+      'elapsed (s)':           elapsed,
+      'bytes sent':            d.bytesSent,
+      'throughput (Mbit/s)':   mbps,
+      'sendOnChannel calls':   d.calls,
+      'avg queue-wait (ms)':   avgQueue,   // how long sendOnChannel blocked before dequeue
+      'drain entries':         d.drainCount,
+      'avg drain wait (ms)':   avgDrain,   // avg time spent in _drainBuffer
+      'peak concurrent drains':d.peakConcurrent,
+    });
+    return d;
   }
 
   // ── Public API ─────────────────────────────────────────────────────────
@@ -140,10 +174,16 @@ export class WebRTCMesh extends EventTarget {
   // link), the new item sits in `pending` and the Promise resolves only once it is
   // dequeued — so room.js won't race ahead more than one buffer per channel.
   sendOnChannel(dc, buffer) {
+    const d = this._xferDiag;
+    d.calls++;
+    const enqueueAt = performance.now();
     let q = this._writeQueues.get(dc);
     if (!q) { q = { pending: [], running: false }; this._writeQueues.set(dc, q); }
     return new Promise(resolve => {
-      q.pending.push({ buffer, resolve });
+      q.pending.push({ buffer, resolve: () => {
+        d.queueWaitMs += performance.now() - enqueueAt;
+        resolve();
+      }});
       if (!q.running) this._runDCQueue(dc, q);
     });
   }
@@ -153,9 +193,16 @@ export class WebRTCMesh extends EventTarget {
   async _runDCQueue(dc, q) {
     q.running = true;
     while (q.pending.length > 0) {
+      if (dc.readyState !== 'open') {
+        // DC closed mid-transfer — unblock all waiting callers so they don't hang,
+        // then let the normal error/close handling propagate up.
+        console.warn('[queue] DC', dc.label, 'closed with', q.pending.length, 'items pending — flushing');
+        while (q.pending.length > 0) q.pending.shift().resolve();
+        break;
+      }
       const { buffer, resolve } = q.pending.shift();
-      resolve();                        // unblock caller — next channel can start immediately
-      await this._sendOnDC(dc, buffer); // SCTP drain blocking is local to this loop only
+      resolve();                        // unblock caller immediately
+      await this._sendOnDC(dc, buffer); // SCTP drain — blocks only this channel's loop
     }
     q.running = false;
   }
@@ -407,6 +454,7 @@ export class WebRTCMesh extends EventTarget {
       if (dc.bufferedAmount > high) {
         await this._drainBuffer(dc);
       }
+      this._xferDiag.bytesSent += frame.byteLength;
       dc.send(frame);
     }
   }
@@ -418,6 +466,13 @@ export class WebRTCMesh extends EventTarget {
     const budget = dc._sharedBufHigh ?? dc;
     const high   = budget._bufHigh ?? BUF_MIN;
     const t0     = performance.now();
+    const d = this._xferDiag;
+    d.drainCount++;
+    d.concurrentDrains++;
+    if (d.concurrentDrains > d.peakConcurrent) d.peakConcurrent = d.concurrentDrains;
+    // Snapshot which channels are currently draining (label them for the log)
+    const drainingLabel = `[drain] entering ${dc.label} | buffered=${(dc.bufferedAmount/1024).toFixed(0)}KB high=${(high/1024).toFixed(0)}KB | concurrent=${d.concurrentDrains}`;
+    console.debug(drainingLabel);
     // Resume at high/2 so the sender wakes while there is still headroom —
     // avoids the "fill to high, idle until high" pattern that causes long stalls.
     const resume = Math.max(DC_CHUNK, (high / 2) | 0);
@@ -450,7 +505,15 @@ export class WebRTCMesh extends EventTarget {
       }, 5_000);
     });
     const elapsed = performance.now() - t0;
-    if (elapsed > 200) console.warn('[drain] slow drain', Math.round(elapsed), 'ms on', dc.label);
+    d.drainMs += elapsed;
+    d.concurrentDrains--;
+    // Always log drain exit so we can see overlap: if multiple channels were
+    // draining concurrently their [exit] lines will interleave in the console.
+    // Log throughput instead of "slow drain" — the link IS the ceiling.
+    // drained = how much left the buffer during this wait (high → current)
+    const drained  = Math.max(0, high - dc.bufferedAmount);
+    const kbps     = elapsed > 0 ? ((drained * 8) / elapsed).toFixed(0) : '?';
+    console.debug(`[drain] exit ${dc.label} | ${Math.round(elapsed)} ms | ~${kbps} kbps | buffered=${(dc.bufferedAmount/1024).toFixed(0)}KB | concurrent=${d.concurrentDrains} | bufHigh=${((budget._bufHigh??BUF_MIN)/1024).toFixed(0)}KB`);
     // Write adaptation result back to shared budget so all pool channels on this
     // peer converge together rather than each channel tuning independently.
     if (elapsed < 20 && budget._bufHigh < BUF_MAX) {
