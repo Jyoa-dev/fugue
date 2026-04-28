@@ -26,10 +26,10 @@ const BUF_MAX =  16  * 1024 * 1024; // 16 MB ceiling
 function initialBufHigh() {
   const c = navigator.connection || navigator.mozConnection;
   if (c) {
-    if (c.downlink > 10 || c.type === 'wifi')     return  8 * 1024 * 1024; // 8 MB
-    if (c.downlink <  2 || c.type === 'cellular') return  1 * 1024 * 1024; // 1 MB
+    if (c.downlink > 10 || c.type === 'wifi')     return 4 * 1024 * 1024; // 4 MB
+    if (c.downlink <  2 || c.type === 'cellular') return BUF_MIN;          // 512 KB
   }
-  return 4 * 1024 * 1024; // 4 MB — same as the previous hard-coded default
+  return 1 * 1024 * 1024; // 1 MB — was 4 MB; lets the grow path ramp up quickly
 }
 
 // ── Transfer pool ────────────────────────────────────────────────────────
@@ -60,6 +60,8 @@ export class WebRTCMesh extends EventTarget {
     this._xferPoolResolve = new Map(); // peerId → pending getPoolChannels resolver
     /** @type {Map<string, RTCDataChannel[]>} */
     this._xferPoolBuf     = new Map(); // peerId → DCs received but pool not yet full
+    /** @type {Map<string, { bufHigh: number }>} */
+    this._xferBufHigh     = new Map(); // peerId → shared back-pressure budget for pool DCs
   }
 
   // ── Public API ─────────────────────────────────────────────────────────
@@ -99,6 +101,7 @@ export class WebRTCMesh extends EventTarget {
     this._xferPool.delete(peerId);
     this._xferPoolResolve.delete(peerId); // abandons any pending getPoolChannels (timer rejects)
     this._xferPoolBuf.delete(peerId);
+    this._xferBufHigh.delete(peerId);
     for (const [key, asm] of this._assemblers) {
       if (asm.peerId === peerId) this._assemblers.delete(key);
     }
@@ -181,6 +184,12 @@ export class WebRTCMesh extends EventTarget {
   _openPool(peerId, pc) {
     const dcs = [];
     let openCount = 0;
+
+    // Shared budget — all pool DCs on this peer adapt together instead of
+    // each channel independently tuning its own threshold.
+    const shared = { bufHigh: initialBufHigh() };
+    this._xferBufHigh.set(peerId, shared);
+
     const onOpen = () => {
       if (++openCount < XFER_POOL_SIZE) return;
       console.log('[pool] initiator pool ready for', peerId.slice(0,8));
@@ -189,9 +198,9 @@ export class WebRTCMesh extends EventTarget {
       this._xferPoolResolve.delete(peerId);
     };
     for (let i = 0; i < XFER_POOL_SIZE; i++) {
-      const dc = pc.createDataChannel(`xferp-${i}`, { ordered: true });
-      dc.binaryType = 'arraybuffer';
-      dc._bufHigh   = initialBufHigh();
+      const dc = pc.createDataChannel(`xferp-${i}`, { ordered: false }); // ordered:false — no SCTP HOL blocking
+      dc.binaryType     = 'arraybuffer';
+      dc._sharedBufHigh = shared; // point at shared object, not a per-DC value
       dc.onopen     = onOpen;
       dc.onmessage  = ({ data }) => this._handleFrame(peerId, data);
       dc.onerror    = e => console.warn('pool DC error', peerId, dc.label, e);
@@ -252,6 +261,12 @@ export class WebRTCMesh extends EventTarget {
             const pool = buf.slice();
             this._xferPoolBuf.delete(peerId);
             this._xferPool.set(peerId, pool);
+
+            // Shared budget for responder pool — same as initiator side.
+            const shared = { bufHigh: initialBufHigh() };
+            this._xferBufHigh.set(peerId, shared);
+            pool.forEach(dc => { dc._sharedBufHigh = shared; });
+
             console.log('[pool] responder pool ready for', peerId.slice(0,8));
             this._xferPoolResolve.get(peerId)?.(pool);
             this._xferPoolResolve.delete(peerId);
@@ -350,9 +365,9 @@ export class WebRTCMesh extends EventTarget {
       view.setUint32(8, i,          true);
       // Direct copy from source — skips the intermediate slice() allocation + copy.
       new Uint8Array(frame, 12).set(new Uint8Array(bytes, offset, chunkBytes));
-      // Only yield to the event loop when the send buffer is actually full.
-      // Avoids ~thousands of unnecessary microtask yields for large transfers.
-      if (dc.bufferedAmount > (dc._bufHigh ?? BUF_MIN)) {
+      // Use shared budget if this is a pool channel, else fall back to per-DC _bufHigh.
+      const high = (dc._sharedBufHigh ?? dc)._bufHigh ?? BUF_MIN;
+      if (dc.bufferedAmount > high) {
         await this._drainBuffer(dc);
       }
       dc.send(frame);
@@ -360,29 +375,50 @@ export class WebRTCMesh extends EventTarget {
   }
 
   // Called only when bufferedAmount exceeded the threshold. Waits for drain,
-  // then tunes _bufHigh up/down based on how long the drain took.
+  // then tunes the shared (or per-DC) budget up/down based on how long it took.
   async _drainBuffer(dc) {
-    const high = dc._bufHigh ?? BUF_MIN;
-    const t0   = performance.now();
+    // Read/write from shared budget if pool channel, else fall back to per-DC.
+    const budget = dc._sharedBufHigh ?? dc;
+    const high   = budget._bufHigh ?? BUF_MIN;
+    const t0     = performance.now();
     await new Promise(r => {
-      const onLow = () => { clearTimeout(hangTimer); r(); };
+      let done = false;
+      const resolve = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(hangTimer);
+        clearInterval(poll);
+        r();
+      };
       dc.bufferedAmountLowThreshold = high;
-      dc.addEventListener('bufferedamountlow', onLow, { once: true });
-      // Log if drain stalls — helps detect the leaked-promise bug on DC close.
+      dc.addEventListener('bufferedamountlow', resolve, { once: true });
+      // Polling fallback: Safari iOS does not reliably fire bufferedamountlow.
+      // Poll every 50 ms (was 150 ms) — cheap idle interval, noticeably faster on slow links.
+      const poll = setInterval(() => {
+        if (dc.readyState !== 'open' || dc.bufferedAmount <= high) {
+          dc.removeEventListener('bufferedamountlow', resolve);
+          resolve();
+        }
+      }, 50);
+      // After 5 s the hang is real; force the threshold to BUF_MIN so the
+      // next poll tick unblocks the channel instead of waiting indefinitely.
+      // (Previously this only logged — channels could stall forever on Safari/iOS.)
       const hangTimer = setTimeout(() => {
         console.warn('[drain] bufferedamountlow never fired after 5 s',
           '| dc:', dc.label, '| state:', dc.readyState,
           '| buffered:', dc.bufferedAmount, '| high:', high);
+        budget._bufHigh = BUF_MIN;
+        dc.bufferedAmountLowThreshold = BUF_MIN;
       }, 5_000);
     });
     const elapsed = performance.now() - t0;
     if (elapsed > 500) console.warn('[drain] slow drain', Math.round(elapsed), 'ms on', dc.label);
-    // Fast drain → link can sustain more; grow threshold.
-    if (elapsed < 20 && dc._bufHigh < BUF_MAX) {
-      dc._bufHigh = Math.min(BUF_MAX, (dc._bufHigh * 1.5) | 0);
-    // Slow drain → link is saturated; shrink threshold.
-    } else if (elapsed > 200 && dc._bufHigh > BUF_MIN) {
-      dc._bufHigh = Math.max(BUF_MIN, (dc._bufHigh * 0.75) | 0);
+    // Write adaptation result back to shared budget so all pool channels on this
+    // peer converge together rather than each channel tuning independently.
+    if (elapsed < 20 && budget._bufHigh < BUF_MAX) {
+      budget._bufHigh = Math.min(BUF_MAX, (budget._bufHigh * 1.5) | 0);
+    } else if (elapsed > 200 && budget._bufHigh > BUF_MIN) {
+      budget._bufHigh = Math.max(BUF_MIN, (budget._bufHigh * 0.75) | 0);
     }
   }
 }

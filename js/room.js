@@ -867,14 +867,20 @@ export class Room {
     if (this._swActive.has(fileId)) { this._swDL.abort(fileId); this._swActive.delete(fileId); }
     this.fileStore.setStatus(fileId, 'paused');
     // Progress is preserved — do not reset to 0.
+    this.onFileUpdate?.();
   }
 
   cancelDownload(fileId) {
     this._cancelled.add(fileId);
     this._pending.delete(fileId);
     if (this._swActive.has(fileId)) { this._swDL.abort(fileId); this._swActive.delete(fileId); }
+    this._speedMap.delete(fileId);
     this.fileStore.setStatus(fileId, 'available');
     this.fileStore.updateProgress(fileId, 0);
+    this.onFileUpdate?.();
+    // Notify the conversation so it can clear the inline progress bar and
+    // reset the file message back to its pre-download (offer) state.
+    this.onMessage?.({ type: 'file_cancel', fileId });
   }
 
   get myColor() { return Identity.colorFor(this.identity); }

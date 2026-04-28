@@ -189,6 +189,15 @@ export const UI = (() => {
       return;
     }
 
+    // ── File cancel — clear in-progress bubble immediately ────────────────
+    if (msg.type === 'file_cancel') {
+      const wrap   = $(`progwrap-${msg.fileId}`);
+      const action = $(`bubble-action-${msg.fileId}`);
+      if (wrap)   { wrap.classList.add('hidden'); }
+      if (action) { _setActionText(action, '↓'); }
+      return;
+    }
+
     // ── File announce ─────────────────────────────────────────────────────
     if (msg.type === 'file_announce') {
       const peer  = peers.get(msg.senderId);
@@ -582,9 +591,17 @@ export const UI = (() => {
       _setActionText(action, isMine ? '↑' : '↓');
     } else if (status === 'downloading') {
       if (wrap) wrap.classList.remove('hidden');
-      _setActionBtn(action, `<button class="btn-ghost-sm pause-btn" data-action="bubble-pause" data-fileid="${fileId}" title="Pause">⏸</button>`);
+      _setActionBtn(action, `
+        <div style="display:flex;gap:3px;align-items:center;padding-right:12px;">
+          <button class="btn-ghost-sm pause-btn"  data-action="bubble-pause"  data-fileid="${fileId}" title="Pause">⏸</button>
+          <button class="btn-ghost-sm cancel-btn" data-action="bubble-cancel" data-fileid="${fileId}" title="Cancel">✕</button>
+        </div>`);
     } else if (status === 'paused') {
-      _setActionBtn(action, `<button class="btn-ghost-sm pause-btn" data-action="bubble-resume" data-fileid="${fileId}" title="Resume">▶</button>`);
+      _setActionBtn(action, `
+        <div style="display:flex;gap:3px;align-items:center;padding-right:12px;">
+          <button class="btn-ghost-sm dl-btn resume-btn" data-action="bubble-resume" data-fileid="${fileId}" title="Resume">▶</button>
+          <button class="btn-ghost-sm cancel-btn"        data-action="bubble-cancel" data-fileid="${fileId}" title="Cancel">✕</button>
+        </div>`);
     }
   }
 
@@ -600,6 +617,7 @@ export const UI = (() => {
         const { action, fileid } = actionBtn.dataset;
         if (action === 'bubble-pause')  room.pauseDownload(fileid);
         if (action === 'bubble-resume') room.requestFile(fileid);
+        if (action === 'bubble-cancel') room.cancelDownload(fileid);
         return;
       }
 

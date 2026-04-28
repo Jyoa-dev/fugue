@@ -14,6 +14,48 @@
 <link rel="stylesheet" href="css/main.css">
 <!-- styles moved to css/main.css -->
 <style>
+/* ── Lobby field clear (×) button ───────────────────────────────────────── */
+.field-input-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+}
+.field-input-wrap input {
+  flex: 1;
+  min-width: 0;
+  padding-right: 26px !important; /* room for clear btn */
+}
+.field-clear-btn {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--text-3);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
+  flex-shrink: 0;
+}
+.field-clear-btn.visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+.field-clear-btn:hover {
+  color: var(--text);
+  background: var(--border);
+}
+
 /* ── Dice icon tilt ──────────────────────────────────────────────────────── */
 #random-pass-btn svg {
   transform: rotate(15deg);
@@ -222,8 +264,13 @@
           <div class="field">
             <label class="field-label">Room name</label>
             <div class="field-row">
-              <input type="text" id="canal-input" placeholder="e.g. cobalt-river-42"
-                     autocomplete="off" spellcheck="false" autocapitalize="none">
+              <div class="field-input-wrap">
+                <input type="text" id="canal-input" placeholder="e.g. cobalt-river-42"
+                       autocomplete="off" spellcheck="false" autocapitalize="none">
+                <button class="field-clear-btn" id="canal-clear-btn" type="button" tabindex="-1" title="Clear">
+                  <svg width="9" height="9" viewBox="0 0 10 10" fill="none"><path d="M1 1l8 8M9 1L1 9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+                </button>
+              </div>
               <div class="fav-wrap">
                 <button class="btn-icon" id="fav-btn" title="Favorites">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -309,7 +356,12 @@
               <span class="field-note">— optional, enables E2E encryption</span>
             </label>
             <div class="field-row">
-              <input type="password" id="passphrase-input" placeholder="Leave empty for plaintext">
+              <div class="field-input-wrap">
+                <input type="password" id="passphrase-input" placeholder="Leave empty for plaintext">
+                <button class="field-clear-btn" id="passphrase-clear-btn" type="button" tabindex="-1" title="Clear">
+                  <svg width="9" height="9" viewBox="0 0 10 10" fill="none"><path d="M1 1l8 8M9 1L1 9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+                </button>
+              </div>
               <button class="btn-icon" id="random-pass-btn" title="Generate random passphrase">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
                   <rect x="3" y="3" width="18" height="18" rx="3" stroke="currentColor" stroke-width="1.8"/>
@@ -578,6 +630,40 @@ document.addEventListener('pointerdown', function(e) {
     </div>
   </div>
 </div>
+
+<!-- ── Lobby field clear buttons ─────────────────────────────────────── -->
+<script>
+(function () {
+  var pairs = [
+    ['canal-input',      'canal-clear-btn'],
+    ['passphrase-input', 'passphrase-clear-btn'],
+  ];
+  function sync(input, btn) {
+    var has = input.value.length > 0;
+    btn.classList.toggle('visible', has);
+  }
+  pairs.forEach(function(pair) {
+    var input = document.getElementById(pair[0]);
+    var btn   = document.getElementById(pair[1]);
+    if (!input || !btn) return;
+    // show/hide on every keystroke
+    input.addEventListener('input',  function() { sync(input, btn); });
+    input.addEventListener('change', function() { sync(input, btn); });
+    // clicking the × clears and focuses
+    btn.addEventListener('mousedown', function(e) {
+      e.preventDefault(); // don't steal focus from input
+    });
+    btn.addEventListener('click', function() {
+      input.value = '';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.focus();
+      sync(input, btn);
+    });
+    // initial state (e.g. pre-filled from URL params)
+    sync(input, btn);
+  });
+})();
+</script>
 
 <div class="mini-dialog-backdrop" id="fav-delete-dialog">
   <div class="mini-dialog">

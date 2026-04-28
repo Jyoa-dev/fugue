@@ -493,8 +493,15 @@ const App = (() => {
         if (def?.room) { fillCanal = def.room; if (!fillKey && def.pass) fillKey = def.pass; }
       } catch {}
     }
-    document.getElementById('canal-input').value = fillCanal || generateComplexCanal();
-    if (fillKey) document.getElementById('passphrase-input').value = fillKey;
+    const canalInput = document.getElementById('canal-input');
+    canalInput.value = fillCanal || generateComplexCanal();
+    canalInput.dispatchEvent(new Event('input', { bubbles: true }));
+
+    if (fillKey) {
+      const passInput = document.getElementById('passphrase-input');
+      passInput.value = fillKey;
+      passInput.dispatchEvent(new Event('input', { bubbles: true }));
+    }
     document.getElementById('relay-input').value = relay || getDefaultRelay();
   }
 
@@ -508,12 +515,15 @@ const App = (() => {
       e.returnValue = '';
     });
     document.getElementById('random-canal-btn').addEventListener('click', () => {
-      document.getElementById('canal-input').value = generateComplexCanal();
+      const el = document.getElementById('canal-input');
+      el.value = generateComplexCanal();
+      el.dispatchEvent(new Event('input', { bubbles: true }));
     });
     document.getElementById('random-pass-btn')?.addEventListener('click', () => {
       const input = document.getElementById('passphrase-input');
       input.value = generateComplexPassword();
       input.type  = 'text'; // reveal briefly so user can see/copy it
+      input.dispatchEvent(new Event('input', { bubbles: true }));
       setTimeout(() => { input.type = 'password'; }, 2500);
     });
     document.getElementById('canal-input').addEventListener('input', e => {
