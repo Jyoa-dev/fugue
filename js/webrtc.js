@@ -17,19 +17,25 @@ const ICE_SERVERS = [
 const DC_CHUNK = 64 * 1024; // 64 KB — required for Safari compatibility
 
 // ── Adaptive back-pressure ───────────────────────────────────────────────
-// Each DataChannel gets its own _bufHigh that tunes itself:
-//   drain < 20 ms  → buffer was too small, grow ×1.5 (up to BUF_MAX)
-//   drain > 200 ms → buffer was too large, shrink ×0.75 (down to BUF_MIN)
-const BUF_MIN = 512  * 1024;       //  512 KB floor
-const BUF_MAX =  16  * 1024 * 1024; // 16 MB ceiling
+// Each DataChannel gets its own _bufHigh (send watermark) that tunes itself:
+//   drain < 20 ms   → buffer too small,  grow  ×1.25 (up to BUF_MAX)
+//   drain 150–300ms → buffer slightly large, shrink ×0.75
+//   drain > 300 ms  → buffer way too large,  shrink ×0.5  (fast convergence)
+//
+// The RESUME threshold (bufferedAmountLowThreshold) is set to high/2 so the
+// sender wakes up while there is still room in the pipe — no idle stall.
+const BUF_MIN = 128  * 1024;        //  128 KB floor  (was 512 KB — too large for cellular)
+const BUF_MAX =  16  * 1024 * 1024; //   16 MB ceiling
 
 function initialBufHigh() {
   const c = navigator.connection || navigator.mozConnection;
   if (c) {
-    if (c.downlink > 10 || c.type === 'wifi')     return 4 * 1024 * 1024; // 4 MB
-    if (c.downlink <  2 || c.type === 'cellular') return BUF_MIN;          // 512 KB
+    // wifi/downlink detection reflects the LOCAL nic, not the peer's link.
+    // Stay conservative so the adaptive can grow rather than stall on first drain.
+    if (c.downlink > 10 || c.type === 'wifi')     return 1 * 1024 * 1024; // 1 MB  (was 4 MB)
+    if (c.downlink <  2 || c.type === 'cellular') return BUF_MIN;
   }
-  return 1 * 1024 * 1024; // 1 MB — was 4 MB; lets the grow path ramp up quickly
+  return 256 * 1024; // 256 KB default — ramps up quickly if link is fast
 }
 
 // ── Transfer pool ────────────────────────────────────────────────────────
@@ -381,6 +387,9 @@ export class WebRTCMesh extends EventTarget {
     const budget = dc._sharedBufHigh ?? dc;
     const high   = budget._bufHigh ?? BUF_MIN;
     const t0     = performance.now();
+    // Resume at high/2 so the sender wakes while there is still headroom —
+    // avoids the "fill to high, idle until high" pattern that causes long stalls.
+    const resume = Math.max(DC_CHUNK, (high / 2) | 0);
     await new Promise(r => {
       let done = false;
       const resolve = () => {
@@ -390,19 +399,17 @@ export class WebRTCMesh extends EventTarget {
         clearInterval(poll);
         r();
       };
-      dc.bufferedAmountLowThreshold = high;
+      dc.bufferedAmountLowThreshold = resume;
       dc.addEventListener('bufferedamountlow', resolve, { once: true });
       // Polling fallback: Safari iOS does not reliably fire bufferedamountlow.
-      // Poll every 50 ms (was 150 ms) — cheap idle interval, noticeably faster on slow links.
       const poll = setInterval(() => {
-        if (dc.readyState !== 'open' || dc.bufferedAmount <= high) {
+        if (dc.readyState !== 'open' || dc.bufferedAmount <= resume) {
           dc.removeEventListener('bufferedamountlow', resolve);
           resolve();
         }
       }, 50);
       // After 5 s the hang is real; force the threshold to BUF_MIN so the
       // next poll tick unblocks the channel instead of waiting indefinitely.
-      // (Previously this only logged — channels could stall forever on Safari/iOS.)
       const hangTimer = setTimeout(() => {
         console.warn('[drain] bufferedamountlow never fired after 5 s',
           '| dc:', dc.label, '| state:', dc.readyState,
@@ -412,12 +419,17 @@ export class WebRTCMesh extends EventTarget {
       }, 5_000);
     });
     const elapsed = performance.now() - t0;
-    if (elapsed > 500) console.warn('[drain] slow drain', Math.round(elapsed), 'ms on', dc.label);
+    if (elapsed > 200) console.warn('[drain] slow drain', Math.round(elapsed), 'ms on', dc.label);
     // Write adaptation result back to shared budget so all pool channels on this
     // peer converge together rather than each channel tuning independently.
     if (elapsed < 20 && budget._bufHigh < BUF_MAX) {
-      budget._bufHigh = Math.min(BUF_MAX, (budget._bufHigh * 1.5) | 0);
-    } else if (elapsed > 200 && budget._bufHigh > BUF_MIN) {
+      // Fast drain → link has headroom, grow conservatively (×1.25 was ×1.5)
+      budget._bufHigh = Math.min(BUF_MAX, (budget._bufHigh * 1.25) | 0);
+    } else if (elapsed > 300 && budget._bufHigh > BUF_MIN) {
+      // Very slow → shrink aggressively to converge quickly
+      budget._bufHigh = Math.max(BUF_MIN, (budget._bufHigh * 0.5) | 0);
+    } else if (elapsed > 150 && budget._bufHigh > BUF_MIN) {
+      // Moderately slow → gentle shrink
       budget._bufHigh = Math.max(BUF_MIN, (budget._bufHigh * 0.75) | 0);
     }
   }
