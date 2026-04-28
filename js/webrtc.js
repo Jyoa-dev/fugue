@@ -68,6 +68,10 @@ export class WebRTCMesh extends EventTarget {
     this._xferPoolBuf     = new Map(); // peerId → DCs received but pool not yet full
     /** @type {Map<string, { bufHigh: number }>} */
     this._xferBufHigh     = new Map(); // peerId → shared back-pressure budget for pool DCs
+    // Per-DC write queues — gives each pool channel an independent drain loop so
+    // concurrent sendOnChannel calls on different DCs overlap instead of serialising.
+    /** @type {WeakMap<RTCDataChannel, { pending: Array<{buffer:ArrayBuffer, resolve:()=>void}>, running:boolean }>} */
+    this._writeQueues     = new WeakMap();
   }
 
   // ── Public API ─────────────────────────────────────────────────────────
@@ -125,8 +129,35 @@ export class WebRTCMesh extends EventTarget {
   }
 
   // Send on a pool DC (from getPoolChannels).
-  async sendOnChannel(dc, buffer) {
-    await this._sendOnDC(dc, buffer);
+  //
+  // Each pool DC has its own independent drain loop (_runDCQueue). This Promise
+  // resolves the moment the buffer is *dequeued* — i.e. this channel's loop has
+  // started on it and the caller can immediately queue the next chunk on a
+  // different channel without blocking. All four xferp-* channels therefore drain
+  // concurrently even when room.js calls sendOnChannel sequentially with await.
+  //
+  // Back-pressure: if this DC's loop is still busy with the previous buffer (slow
+  // link), the new item sits in `pending` and the Promise resolves only once it is
+  // dequeued — so room.js won't race ahead more than one buffer per channel.
+  sendOnChannel(dc, buffer) {
+    let q = this._writeQueues.get(dc);
+    if (!q) { q = { pending: [], running: false }; this._writeQueues.set(dc, q); }
+    return new Promise(resolve => {
+      q.pending.push({ buffer, resolve });
+      if (!q.running) this._runDCQueue(dc, q);
+    });
+  }
+
+  // Independent per-DC drain loop. Runs until the pending queue is empty, then
+  // exits — the next sendOnChannel call will restart it.
+  async _runDCQueue(dc, q) {
+    q.running = true;
+    while (q.pending.length > 0) {
+      const { buffer, resolve } = q.pending.shift();
+      resolve();                        // unblock caller — next channel can start immediately
+      await this._sendOnDC(dc, buffer); // SCTP drain blocking is local to this loop only
+    }
+    q.running = false;
   }
 
   async handleSignal(msg) {
