@@ -7,10 +7,7 @@ import { WebRTCMesh }      from './webrtc.js';
 import { initAndroidBridge } from './webrtc_android_bridge.js';
 import { isLosslessCompressible, compressGzip, decompressGzip } from './compress.js';
 
-// Patch WebRTCMesh for native Android WebRTC if running inside the Android WebView.
-// Must be called here, at module scope, so the prototype is patched before any
-// WebRTCMesh instance is created.
-initAndroidBridge(WebRTCMesh);
+
 
 // ── Module-level singletons (avoid per-call allocation) ──────────────────
 const ENC = new TextEncoder();
@@ -312,6 +309,12 @@ export class Room {
       if (window._webrtcMesh === this._rtc) window._webrtcMesh = null;
       this._rtc = null;
     }
+    // Patch WebRTCMesh prototype for native Android WebRTC.
+    // Done here — not at module load — because window.AndroidRtc is injected by
+    // the Kotlin WebView *after* the JS bundle evaluates, so it isn't visible at
+    // import time. initAndroidBridge is idempotent (checks a guard flag) so
+    // repeated calls on reconnect are safe.
+    initAndroidBridge(WebRTCMesh);
     this._rtc = new WebRTCMesh(obj => this.relay.send(obj), this.myPeerId);
     window._webrtcMesh = this._rtc;
 

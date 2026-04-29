@@ -46,6 +46,12 @@ export function initAndroidBridge(WebRTCMesh) {
     ? 'AndroidRtc detected — will patch WebRTCMesh'
     : 'no AndroidRtc — desktop mode, no patch applied');
   if (!_isAndroid) return;
+  // Guard: only patch once even if called multiple times (e.g. on reconnect).
+  if (WebRTCMesh.prototype._androidBridgeApplied) {
+    _log('already patched — skipping');
+    return;
+  }
+  WebRTCMesh.prototype._androidBridgeApplied = true;
 {
 
   // ── Patch WebRTCMesh prototype ────────────────────────────────────────────
