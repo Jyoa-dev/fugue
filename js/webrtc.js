@@ -71,6 +71,8 @@ export class WebRTCMesh extends EventTarget {
     this._xferPoolBuf     = new Map(); // peerId → DCs received but pool not yet full
     /** @type {Map<string, { bufHigh: number }>} */
     this._xferBufHigh     = new Map(); // peerId → shared back-pressure budget for pool DCs
+    /** @type {Set<string>} peers identified as Android native-WebRTC (via _android flag in rtc_answer) */
+    this._androidPeers    = new Set();
     // Per-DC write queues — gives each pool channel an independent drain loop so
     // concurrent sendOnChannel calls on different DCs overlap instead of serialising.
     /** @type {WeakMap<RTCDataChannel, { pending: Array<{buffer:ArrayBuffer, resolve:()=>void}>, running:boolean }>} */
@@ -154,6 +156,7 @@ export class WebRTCMesh extends EventTarget {
     this._xferPoolResolve.delete(peerId); // abandons any pending getPoolChannels (timer rejects)
     this._xferPoolBuf.delete(peerId);
     this._xferBufHigh.delete(peerId);
+    this._androidPeers.delete(peerId);
     for (const [key, asm] of this._assemblers) {
       if (asm.peerId === peerId) this._assemblers.delete(key);
     }
@@ -252,6 +255,18 @@ export class WebRTCMesh extends EventTarget {
     if (type === 'rtc_answer') {
       const pc = this._pcs.get(senderId);
       if (pc?._native) return; // handed off to webrtc_android_bridge.js
+      // ── Android peer detection ──────────────────────────────────────────
+      // The Android bridge stamps _android:true on every rtc_answer it sends.
+      // Log it once on the desktop so it's visible in DevTools that this peer
+      // is using native Android WebRTC (NativeRtcBridge.kt), not the browser stack.
+      if (msg._android && !this._androidPeers.has(senderId)) {
+        this._androidPeers.add(senderId);
+        console.log(
+          '[mesh] \uD83D\uDCF1 peer', senderId.slice(0, 8),
+          '— Android detected, native WebRTC path active (NativeRtcBridge.kt)',
+          '| total android peers:', this._androidPeers.size,
+        );
+      }
       if (pc && pc.signalingState === 'have-local-offer') {
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
@@ -472,18 +487,22 @@ export class WebRTCMesh extends EventTarget {
       // Use shared budget if this is a pool channel, else fall back to per-DC _bufHigh.
       const high = (dc._sharedBufHigh ?? dc)._bufHigh ?? BUF_MIN;
       if (dc.bufferedAmount > high) {
-        await this._drainBuffer(dc);
+        const stalled = await this._drainBuffer(dc);
+        // If the drain was force-resolved (SCTP stall / hang / DC closed mid-drain)
+        // abort this entire frame sequence now. Continuing to send into a pipe that
+        // isn't draining just re-enters _drainBuffer on the very next frame, creating
+        // a tight thrash loop: force-resolve → send → stall → force-resolve → …
+        // Let _runDCQueue handle the abort (it will flush pending callers cleanly).
+        if (stalled) {
+          console.warn('[send] aborting', dc.label,
+            '— stall/hang during drain, buffered =',
+            (dc.bufferedAmount / 1024).toFixed(0), 'KB');
+          return false;
+        }
       }
-      // If drain force-resolved due to a stall (SCTP flow-control), the buffer
-      // may still be above the high watermark. Skip this frame rather than
-      // pushing more data into a stuck pipe — the caller will get an error or
-      // the DC will close, which is the correct failure signal.
+      // If drain force-resolved due to a stall (SCTP flow-control), we already
+      // returned false above. The only remaining early-exit is DC closure.
       if (dc.readyState !== 'open') return false;
-      if (dc.bufferedAmount > high * 2) {
-        console.warn('[send] aborting', dc.label,
-          '— buffer still', (dc.bufferedAmount/1024).toFixed(0), 'KB after stall');
-        return false; // signals _runDCQueue to abort this DC's loop
-      }
       this._xferDiag.bytesSent += frame.byteLength;
       dc.send(frame);
     }
@@ -576,5 +595,11 @@ export class WebRTCMesh extends EventTarget {
       // Moderately slow → gentle shrink
       budget._bufHigh = Math.max(BUF_MIN, (budget._bufHigh * 0.75) | 0);
     }
+    // Return whether this drain was force-resolved (SCTP stall, hang timeout, or
+    // DC closed) rather than a clean drain. _sendOnDC uses this to abort the
+    // current transfer frame sequence immediately — prevents the thrash loop
+    // where force-resolve exits then the very next send re-enters drain instantly
+    // because bufferedAmount never actually dropped below bufHigh.
+    return forceResolved;
   }
 }

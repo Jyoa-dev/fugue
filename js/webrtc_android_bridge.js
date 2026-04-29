@@ -411,6 +411,7 @@ export function initAndroidBridge(WebRTCMesh) {
   };
 
   // Native layer produced an answer SDP → forward through the signal channel.
+  // _android:true lets the desktop log "this peer is Android, native WebRTC path active".
   window._nativeRtcAnswer = (peerId, sdpJson) => {
     _log('_nativeRtcAnswer — forwarding answer via signal channel for', peerId.slice(0,8));
     const mesh = window._webrtcMesh;
@@ -420,6 +421,7 @@ export function initAndroidBridge(WebRTCMesh) {
       targetId: peerId,
       sdp:      JSON.parse(sdpJson),
       senderId: mesh.myPeerId,
+      _android: true,   // ← desktop reads this in handleSignal to log & track
     });
     _log('_nativeRtcAnswer — signal sent for', peerId.slice(0,8));
   };
