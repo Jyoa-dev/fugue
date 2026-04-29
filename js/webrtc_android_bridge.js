@@ -83,17 +83,18 @@ window.addEventListener('message', (e) => {
 // Peer-id header size used in outbound port messages.
 const _PEER_ID_HDR = 36;
 
-/** Encode outbound frame for the binary port: [channelByte][peerId36][frame] */
+/** Encode outbound frame for the binary port: [channelByte][peerId36][frame]
+ *  Returns a String (ISO-8859-1) — Android WebMessagePort cannot receive
+ *  ArrayBuffer; the Kotlin side decodes with toByteArray(ISO_8859_1).
+ */
 function _portFrame(channelByte, peerId, frameBuffer) {
-  const frameBytes = frameBuffer instanceof ArrayBuffer ? frameBuffer : frameBuffer.buffer;
-  const out        = new ArrayBuffer(1 + _PEER_ID_HDR + frameBytes.byteLength);
-  const view       = new Uint8Array(out);
-  view[0]          = channelByte;
-  // Write peerId as ASCII, space-padded to 36 bytes.
+  const frameBytes  = frameBuffer instanceof ArrayBuffer ? frameBuffer : frameBuffer.buffer;
+  const frameView   = new Uint8Array(frameBytes);
   const peerIdBytes = new TextEncoder().encode(peerId.padEnd(_PEER_ID_HDR));
-  view.set(peerIdBytes, 1);
-  view.set(new Uint8Array(frameBytes), 1 + _PEER_ID_HDR);
-  return out;
+  let str = String.fromCharCode(channelByte);
+  for (let i = 0; i < _PEER_ID_HDR; i++) str += String.fromCharCode(peerIdBytes[i]);
+  for (let i = 0; i < frameView.length;  i++) str += String.fromCharCode(frameView[i]);
+  return str;
 }
 
 /**
@@ -249,7 +250,7 @@ export function initAndroidBridge(WebRTCMesh) {
     if (_rtcPort) {
       // Binary port: channel 0x00 = shared DC.
       const out = _portFrame(0x00, peerId, buffer);
-      _rtcPort.postMessage(out, [out]);
+      _rtcPort.postMessage(out);
     } else {
       // Fallback: base64 via @JavascriptInterface (port not ready yet).
       _warn('sendBinary — port not ready, falling back to base64 sendShared');
@@ -306,7 +307,7 @@ export function initAndroidBridge(WebRTCMesh) {
         // Binary port: channel byte 0x01..0x04 for pool index 0..3.
         const channelByte = 0x01 + index;
         const out = _portFrame(channelByte, peerId, buffer);
-        _rtcPort.postMessage(out, [out]);
+        _rtcPort.postMessage(out);
       } else {
         // Fallback: base64 via @JavascriptInterface.
         _warn('sendOnChannel — port not ready, falling back to base64 sendPool');
