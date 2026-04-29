@@ -174,6 +174,25 @@ export function initAndroidBridge(WebRTCMesh) {
 
       _log('rtc_offer → AndroidRtc.setRemoteOffer(', senderId.slice(0,8), ')');
       window.AndroidRtc.setRemoteOffer(senderId, JSON.stringify(msg.sdp));
+
+      // ── FIX (Bug 2): flush JS-buffered ICE immediately after setRemoteOffer ──
+      // Candidates that arrived before this offer were buffered in _icePending.
+      // They must be handed to native NOW — right after the remote description
+      // has been queued on the native side — so Kotlin can buffer them in its own
+      // pendingIce list until onSetSuccess fires (which it handles internally).
+      // Previously these were flushed only in _nativeRtcReady (when the shared DC
+      // opened), which is hundreds of ms later and unnecessarily delays ICE.
+      const pendingIce = this._icePending.get(senderId);
+      if (pendingIce?.length) {
+        _log('rtc_offer — flushing', pendingIce.length,
+          'pre-offer ICE candidate(s) to native for', senderId.slice(0,8));
+        this._icePending.delete(senderId);
+        for (const c of pendingIce) {
+          _dbg('→ AndroidRtc.addIceCandidate (pre-offer flush)', senderId.slice(0,8));
+          window.AndroidRtc.addIceCandidate(senderId, JSON.stringify(c));
+        }
+      }
+
       return;
     }
 
@@ -231,11 +250,17 @@ export function initAndroidBridge(WebRTCMesh) {
   };
 
   // ── hasChannel ────────────────────────────────────────────────────────────
+  // ── FIX (Bug 1): use isSharedReady, NOT isPoolReady ──────────────────────
+  // hasChannel() gates chat messages. Chat only needs the shared DC ("files").
+  // isPoolReady() returns false until all 4 xferp-* channels are open, which
+  // means any messages queued in _dcReady after peer_ready fires are never
+  // flushed — they sit there until the pool opens (or forever if it doesn't).
+  // The Kotlin side documents this as Fix 2 in isSharedReady()'s KDoc.
   const _origHasChannel = proto.hasChannel;
   proto.hasChannel = function(peerId) {
     const pc = this._pcs.get(peerId);
     if (pc?._native) {
-      const ready = window.AndroidRtc.isPoolReady(peerId);
+      const ready = window.AndroidRtc.isSharedReady(peerId); // ← was isPoolReady
       _dbg('hasChannel (native)', peerId.slice(0,8), '→', ready);
       return ready;
     }
@@ -343,15 +368,17 @@ export function initAndroidBridge(WebRTCMesh) {
     const fakeSharedDc = { readyState: 'open', _nativePeer: peerId };
     mesh._dcs.set(peerId, fakeSharedDc);
 
-    // Flush any pending ICE candidates that arrived before the offer (buffered
-    // in handleSignal's rtc_ice branch when no PC existed yet).
-    const bufferedIce = mesh._icePending.get(peerId);
-    if (bufferedIce?.length) {
-      _log('_nativeRtcReady — flushing', bufferedIce.length,
-        'buffered ICE candidate(s) for', peerId.slice(0,8));
+    // NOTE: Pre-offer ICE candidates are now flushed immediately in handleSignal's
+    // rtc_offer branch (Bug 2 fix), so nothing to do here for _icePending.
+    // Guard retained for safety: if somehow candidates slipped through, log and
+    // forward them now rather than silently losing them.
+    const leftoverIce = mesh._icePending.get(peerId);
+    if (leftoverIce?.length) {
+      _warn('_nativeRtcReady — unexpected leftover ICE candidates for', peerId.slice(0,8),
+        '(should have been flushed in handleSignal rtc_offer branch) — flushing now');
       mesh._icePending.delete(peerId);
-      for (const c of bufferedIce) {
-        _dbg('→ AndroidRtc.addIceCandidate (flushed)', peerId.slice(0,8));
+      for (const c of leftoverIce) {
+        _dbg('→ AndroidRtc.addIceCandidate (leftover flush)', peerId.slice(0,8));
         window.AndroidRtc.addIceCandidate(peerId, JSON.stringify(c));
       }
     }
