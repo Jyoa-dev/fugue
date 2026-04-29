@@ -48,46 +48,14 @@ const _warn = (...a) => console.warn ('[android-bridge]', ...a);
  * present. Must be called with the WebRTCMesh *class* (not an instance) after
  * importing it. Safe to call on desktop — it exits immediately if AndroidRtc
  * is not defined.
- *
- * On desktop this function still applies a minimal patch so that incoming
- * rtc_offer / rtc_answer signals carrying _android:true are logged and
- * re-emitted as a 'peer_android' CustomEvent on the mesh instance. This is
- * what drives the "Android peer connected" log on the desktop side.
  */
 export function initAndroidBridge(WebRTCMesh) {
   const _isAndroid = typeof window.AndroidRtc !== 'undefined';
   _log(_isAndroid
     ? 'AndroidRtc detected — will patch WebRTCMesh'
     : 'no AndroidRtc — desktop mode, no patch applied');
-  if (!_isAndroid) {
-    // ── Desktop-side patch: detect Android peers ──────────────────────────
-    // When an Android peer connects it sends rtc_offer or rtc_answer with
-    // _android:true. Hook handleSignal on the prototype to spot that flag and:
-    //   1. Log it so the developer can see the connection in the desktop console.
-    //   2. Dispatch a 'peer_android' CustomEvent on the mesh instance so room.js
-    //      (or any other listener) can react without touching webrtc.js.
-    if (WebRTCMesh.prototype._androidBridgeDesktopApplied) {
-      _log('desktop patch already applied — skipping');
-      return;
-    }
-    WebRTCMesh.prototype._androidBridgeDesktopApplied = true;
-
-    const proto = WebRTCMesh.prototype;
-    const _origHandleSignalDesktop = proto.handleSignal;
-    proto.handleSignal = async function(msg) {
-      if (msg._android && (msg.type === 'rtc_offer' || msg.type === 'rtc_answer')) {
-        _log('⚡ Android peer detected via', msg.type, '— peerId:', msg.senderId.slice(0,8));
-        this.dispatchEvent(new CustomEvent('peer_android', {
-          detail: { peerId: msg.senderId, via: msg.type },
-        }));
-      }
-      return _origHandleSignalDesktop.call(this, msg);
-    };
-
-    _log('✓ desktop handleSignal patched for Android peer detection');
-    return;
-  }
-  // Guard: only patch the Android path once even if called multiple times.
+  if (!_isAndroid) return;
+  // Guard: only patch once even if called multiple times (e.g. on reconnect).
   if (WebRTCMesh.prototype._androidBridgeApplied) {
     _log('already patched — skipping');
     return;
@@ -497,22 +465,15 @@ export function initAndroidBridge(WebRTCMesh) {
   // Each frame has the standard 12-byte transport header:
   //   [transferId u32le][total u32le][index u32le][payload...]
   //
-  // We must pass these through mesh._handleFrame() — the same reassembler used
-  // on the desktop path — so multi-frame transfers are merged before room.js
-  // sees them. Dispatching 'binary' directly bypassed reassembly, causing
-  // room.js to receive partial 64 KB slices instead of the full file chunk,
-  // which broke downloads.
+  // Route through mesh._handleFrame() — the same reassembler the desktop DC path
+  // uses — so multi-frame transfers are merged before room.js sees them.
+  //
+  // No per-frame logging: this fires once per 64 KB frame. console.debug on
+  // Android WebView is synchronous and measurably throttles throughput at speed.
   window._nativeRtcChunk = (peerId, b64Payload) => {
-    _dbg('_nativeRtcChunk — inbound binary from', peerId.slice(0,8));
     const mesh = window._webrtcMesh;
     if (!mesh) { _warn('_nativeRtcChunk — no _webrtcMesh on window!'); return; }
-    const buffer = _fromB64(b64Payload);
-    _dbg('_nativeRtcChunk — decoded', buffer.byteLength, 'bytes from', peerId.slice(0,8),
-      '— feeding into _handleFrame for reassembly');
-    // _handleFrame(peerId, ArrayBuffer) is the standard transport-layer reassembler.
-    // It accumulates fragments and fires 'binary' once all frames for a transferId
-    // have arrived, identical to the desktop DC onmessage path.
-    mesh._handleFrame(peerId, buffer);
+    mesh._handleFrame(peerId, _fromB64(b64Payload));
   };
 
   // Native PC failed/closed.

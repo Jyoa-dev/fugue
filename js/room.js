@@ -506,9 +506,13 @@ export class Room {
     const elapsed = (now - spd.lastTs) / 1000;
     if (elapsed >= 0.5) { spd.bps = spd.bytes / elapsed; spd.bytes = 0; spd.lastTs = now; this.fileStore.setSpeed(fileId, spd.bps); }
 
-    // Decrypt if needed (worker[0] always — preserves FIFO order for SW streaming)
+    // Decrypt if needed (worker[0] always — preserves FIFO order for SW streaming).
+    // Skip when encrypted=false: NativeRtcBridge.kt decrypts AES-GCM chunks natively
+    // and clears the flag before delivery, so hitting the JS crypto worker here would
+    // double-decrypt and corrupt the data. For browser peers encrypted is always true
+    // when this._crypto is set, so this check is a no-op on the desktop path.
     let data = chunkBuf;
-    if (fromDC && this._crypto) {
+    if (fromDC && this._crypto && encrypted) {
       try { data = await this._crypto.decrypt(chunkBuf, 'session'); }
       catch { console.warn('DC chunk decrypt failed'); return; }
     }
