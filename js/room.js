@@ -4,6 +4,7 @@ import { Chunker }         from './chunker.js';
 import { RelayConnection } from './relay.js';
 import { FileStore }       from './fileStore.js';
 import { WebRTCMesh }      from './webrtc.js';
+import './webrtc_android_bridge.js';
 import { isLosslessCompressible, compressGzip, decompressGzip } from './compress.js';
 
 // ── Module-level singletons (avoid per-call allocation) ──────────────────
@@ -303,9 +304,11 @@ export class Room {
     if (this._rtc) {
       if (this._rtc.myPeerId === this.myPeerId) return;
       for (const peerId of this._rtc._pcs.keys()) this._rtc.removePeer(peerId);
+      if (window._webrtcMesh === this._rtc) window._webrtcMesh = null;
       this._rtc = null;
     }
     this._rtc = new WebRTCMesh(obj => this.relay.send(obj), this.myPeerId);
+    window._webrtcMesh = this._rtc;
 
     this._rtc.addEventListener('binary', async ({ detail: { peerId, buffer } }) => {
       const frame = decodeDCFrame(buffer);
@@ -579,12 +582,12 @@ export class Room {
 
   /** Broadcast our LAN capabilities to [peerId] over the open DC. */
   _sendLanCaps(peerId) {
-    if (!window.NativeBridge?.isAndroid) return;
+    if (typeof window.AndroidRtc === 'undefined') return;
     try {
       const caps = JSON.stringify({
         android     : true,
         peerId      : this.myPeerId,
-        lanIp       : window.NativeBridge.getLanIp?.() || '',
+        lanIp       : window.AndroidRtc.getLanIp?.() || '',
         directReady : false,
       });
       const payload = ENC.encode(caps);
@@ -680,8 +683,11 @@ export class Room {
 
     // ── LAN fast-path (files ≥ 5 MB, Android only) ───────────────────────
     // Attempt TCP over Wi-Fi Direct or LAN before falling through to WebRTC DC.
+    // On Android, the bridge's patched sendOnChannel/getPoolChannels already
+    // route through native WebRTC; the LAN TCP path is an additional shortcut
+    // for very large files where TCP throughput exceeds SCTP.
     let useLan = false;
-    if (entry.file.size >= LAN_MIN_SIZE && window.NativeBridge?.isAndroid) {
+    if (entry.file.size >= LAN_MIN_SIZE && typeof window.AndroidRtc !== 'undefined') {
       console.log('[lan] file is', (entry.file.size / 1024 / 1024).toFixed(1), 'MB — attempting LAN connect to', requesterId.slice(0, 8));
       useLan = await this._waitForLanReady(requesterId, 10_000);
       console.log('[lan] useLan =', useLan);
@@ -696,7 +702,7 @@ export class Room {
       if (useLan) {
         // Convert to base64 — JavascriptInterface only accepts strings.
         const b64 = btoa(String.fromCharCode(...new Uint8Array(frame)));
-        const ok  = window.NativeBridge.sendLanChunk(requesterId, b64);
+        const ok  = window.AndroidRtc.sendLanChunk(requesterId, b64);
         if (!ok) {
           // TCP session dropped mid-transfer — fall back immediately.
           console.warn('[lan] sendLanChunk failed at chunk', chunk.index, '— falling back to WebRTC');
@@ -753,10 +759,27 @@ export class Room {
   }
 
   _saveFile(blob, meta) {
-    const b   = blob instanceof Blob ? blob : new Blob([blob], { type: meta?.mimeType || 'application/octet-stream' });
+    const b    = blob instanceof Blob ? blob : new Blob([blob], { type: meta?.mimeType || 'application/octet-stream' });
+    const name = meta?.name || 'download';
+
+    // On Android, hand the blob off to the native layer so it can write to
+    // the Downloads directory via MediaStore — anchor-click is a no-op in the
+    // embedded WebView.
+    if (typeof window.AndroidRtc !== 'undefined' && window.AndroidRtc.saveFile) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        // reader.result is a data-URL; strip the prefix to get raw base64.
+        const b64 = reader.result.split(',')[1];
+        window.AndroidRtc.saveFile(name, meta?.mimeType || 'application/octet-stream', b64);
+      };
+      reader.readAsDataURL(b);
+      if (isPreviewable(meta?.mimeType, name)) return URL.createObjectURL(b);
+      return null;
+    }
+
     const url = URL.createObjectURL(b);
-    Object.assign(document.createElement('a'), { href: url, download: meta?.name || 'download' }).click();
-    if (isPreviewable(meta?.mimeType, meta?.name)) return url;
+    Object.assign(document.createElement('a'), { href: url, download: name }).click();
+    if (isPreviewable(meta?.mimeType, name)) return url;
     URL.revokeObjectURL(url);
     return null;
   }
@@ -892,6 +915,7 @@ export class Room {
     for (const fileId of this._swActive.keys()) this._swDL.abort(fileId);
     this._swActive.clear();
     for (const peerId of (this._rtc?._pcs?.keys() || [])) this._rtc.removePeer(peerId);
+    if (window._webrtcMesh === this._rtc) window._webrtcMesh = null;
     window.removeEventListener('beforeunload', this._onBeforeUnload);
     this.relay.send({ type: 'leave' });
     this.relay.disconnect();
