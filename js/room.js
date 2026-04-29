@@ -4,8 +4,13 @@ import { Chunker }         from './chunker.js';
 import { RelayConnection } from './relay.js';
 import { FileStore }       from './fileStore.js';
 import { WebRTCMesh }      from './webrtc.js';
-import './webrtc_android_bridge.js';
+import { initAndroidBridge } from './webrtc_android_bridge.js';
 import { isLosslessCompressible, compressGzip, decompressGzip } from './compress.js';
+
+// Patch WebRTCMesh for native Android WebRTC if running inside the Android WebView.
+// Must be called here, at module scope, so the prototype is patched before any
+// WebRTCMesh instance is created.
+initAndroidBridge(WebRTCMesh);
 
 // ── Module-level singletons (avoid per-call allocation) ──────────────────
 const ENC = new TextEncoder();

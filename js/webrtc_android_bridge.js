@@ -1,7 +1,8 @@
 // ── webrtc_android_bridge.js ─────────────────────────────────────────────────
-// Import this AFTER webrtc.js. When running inside the Android WebView with
-// window.AndroidRtc present, it monkey-patches WebRTCMesh so all
-// desktop↔Android connections use native WebRTC instead of the browser stack.
+// Call initAndroidBridge(WebRTCMesh) after importing WebRTCMesh.
+// When running inside the Android WebView with window.AndroidRtc present it
+// monkey-patches WebRTCMesh so all desktop↔Android connections use native
+// WebRTC instead of the browser stack.
 //
 // Everything else (desktop↔desktop, Android↔Android via LAN) is unchanged.
 // The JS assembler, pool logic, and binary event format are fully reused.
@@ -27,19 +28,25 @@
 // native sentinel first, then native path). _origHandleSignal is only called
 // for non-WebRTC message types (LAN caps etc.).
 
-const _isAndroid = typeof window.AndroidRtc !== 'undefined';
-
 // ── Internal log helper ───────────────────────────────────────────────────────
 // Prefix every bridge log consistently. Replace with your own logger if needed.
 const _log  = (...a) => console.log ('[android-bridge]', ...a);
 const _dbg  = (...a) => console.debug('[android-bridge]', ...a);
 const _warn = (...a) => console.warn ('[android-bridge]', ...a);
 
-_log(_isAndroid
-  ? 'AndroidRtc detected — will patch WebRTCMesh'
-  : 'no AndroidRtc — desktop mode, no patch applied');
-
-if (_isAndroid) {
+/**
+ * Patch WebRTCMesh to use native Android WebRTC when window.AndroidRtc is
+ * present. Must be called with the WebRTCMesh *class* (not an instance) after
+ * importing it. Safe to call on desktop — it exits immediately if AndroidRtc
+ * is not defined.
+ */
+export function initAndroidBridge(WebRTCMesh) {
+  const _isAndroid = typeof window.AndroidRtc !== 'undefined';
+  _log(_isAndroid
+    ? 'AndroidRtc detected — will patch WebRTCMesh'
+    : 'no AndroidRtc — desktop mode, no patch applied');
+  if (!_isAndroid) return;
+{
 
   // ── Patch WebRTCMesh prototype ────────────────────────────────────────────
 
@@ -460,4 +467,5 @@ if (_isAndroid) {
   }
 
   _log('✓ WebRTCMesh patched for native WebRTC');
-}
+} // end _isAndroid block
+} // end initAndroidBridge
