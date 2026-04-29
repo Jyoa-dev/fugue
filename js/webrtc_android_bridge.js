@@ -11,7 +11,7 @@
 // ────────────
 //  • _createPC(peerId)  → creates a NativeRtcBridge PC instead of RTCPeerConnection
 //  • addPeer / handleSignal → forward offer/answer/ICE through AndroidRtc.*
-//  • Native layer fires window._nativeRtc{Ready,PoolReady,Answer,Ice,Chunk,Failed}
+//  • Native layer fires window._nativeRtc{Ready,PoolReady,Offer,Answer,Ice,Chunk,Failed}
 //    callbacks which re-enter the mesh as if they came from a real DC/PC.
 //
 // The shim is a no-op on desktop (window.AndroidRtc is undefined).
@@ -27,9 +27,18 @@
 // real RTCPeerConnection already in _pcs → JS path, nothing in _pcs → create
 // native sentinel first, then native path). _origHandleSignal is only called
 // for non-WebRTC message types (LAN caps etc.).
+//
+// ── BUG FIX (Android→desktop / Android-initiator path) ──────────────────────
+// When Android's myPeerId > peerId, Android is the initiator and must create
+// and send the offer. Previously addPeer() did nothing in this branch, leaving
+// both sides waiting for the other to offer — deadlock.
+//
+// Now addPeer() calls AndroidRtc.createOffer(peerId). NativeRtcBridge.kt
+// creates the shared DC + pool DCs, generates the offer SDP, sets it as local
+// description, then fires _nativeRtcOffer. That callback (below) forwards the
+// offer through the signal channel to the desktop, completing the handshake.
 
 // ── Internal log helper ───────────────────────────────────────────────────────
-// Prefix every bridge log consistently. Replace with your own logger if needed.
 const _log  = (...a) => console.log ('[android-bridge]', ...a);
 const _dbg  = (...a) => console.debug('[android-bridge]', ...a);
 const _warn = (...a) => console.warn ('[android-bridge]', ...a);
@@ -61,8 +70,9 @@ export function initAndroidBridge(WebRTCMesh) {
   // ── addPeer ───────────────────────────────────────────────────────────────
   // Replaces RTCPeerConnection creation with a native PC on Android.
   // The peer that has the lexicographically larger id is the initiator
-  // (same rule as the original).  On Android we are always the answerer
-  // for desktop→Android calls (desktop sends the offer via the signal channel).
+  // (same rule as the original). When Android is the initiator it calls
+  // AndroidRtc.createOffer() so native creates the DCs + offer SDP and fires
+  // _nativeRtcOffer back to JS to forward via the signal channel.
   const _origAddPeer = proto.addPeer;
   proto.addPeer = async function(peerId) {
     _log('addPeer called for', peerId.slice(0,8));
@@ -84,13 +94,13 @@ export function initAndroidBridge(WebRTCMesh) {
     _log('→ AndroidRtc.createPeerConnection(', peerId.slice(0,8), ')');
     window.AndroidRtc.createPeerConnection(peerId);
 
-    // If this device is the initiator, create and send an offer natively.
-    // (Desktop→Android: desktop is initiator; this branch handles Android→desktop.)
     if (this.myPeerId > peerId) {
-      // Android-initiated: not the common path, but supported.
+      // Android is the initiator — tell native to create the offer.
+      // NativeRtcBridge.createOffer() opens the shared DC + pool DCs, generates
+      // the SDP, then fires _nativeRtcOffer which forwards it to the desktop.
       _log('addPeer — Android is initiator for', peerId.slice(0,8),
-        '— waiting for native offer from AndroidRtc layer');
-      // Native layer doesn't currently self-create offers; extend here if needed.
+        '— calling AndroidRtc.createOffer');
+      window.AndroidRtc.createOffer(peerId);
     } else {
       _log('addPeer — Android is responder for', peerId.slice(0,8),
         '— waiting for desktop rtc_offer via signal channel');
@@ -124,7 +134,6 @@ export function initAndroidBridge(WebRTCMesh) {
   };
 
   // ── handleSignal ──────────────────────────────────────────────────────────
-  // ── FIX ──────────────────────────────────────────────────────────────────
   // This method now OWNS all rtc_offer / rtc_answer / rtc_ice handling on
   // Android. It no longer delegates to _origHandleSignal for those types.
   //
@@ -180,8 +189,6 @@ export function initAndroidBridge(WebRTCMesh) {
       // They must be handed to native NOW — right after the remote description
       // has been queued on the native side — so Kotlin can buffer them in its own
       // pendingIce list until onSetSuccess fires (which it handles internally).
-      // Previously these were flushed only in _nativeRtcReady (when the shared DC
-      // opened), which is hundreds of ms later and unnecessarily delays ICE.
       const pendingIce = this._icePending.get(senderId);
       if (pendingIce?.length) {
         _log('rtc_offer — flushing', pendingIce.length,
@@ -255,7 +262,6 @@ export function initAndroidBridge(WebRTCMesh) {
   // isPoolReady() returns false until all 4 xferp-* channels are open, which
   // means any messages queued in _dcReady after peer_ready fires are never
   // flushed — they sit there until the pool opens (or forever if it doesn't).
-  // The Kotlin side documents this as Fix 2 in isSharedReady()'s KDoc.
   const _origHasChannel = proto.hasChannel;
   proto.hasChannel = function(peerId) {
     const pc = this._pcs.get(peerId);
@@ -276,7 +282,6 @@ export function initAndroidBridge(WebRTCMesh) {
     _dbg('sendBinary (native shared DC)', peerId.slice(0,8),
       '| bytes:', buffer.byteLength ?? buffer.buffer?.byteLength ?? '?');
 
-    // Encode and send through native shared DC.
     const frames = _splitToFrames(buffer);
     _dbg('sendBinary — split into', frames.length, 'frame(s) for', peerId.slice(0,8));
     for (const [i, frame] of frames.entries()) {
@@ -344,8 +349,6 @@ export function initAndroidBridge(WebRTCMesh) {
       '| channel index:', index,
       '| frames:', frames.length);
 
-    // Return a Promise that resolves after all frames are dispatched (no back-pressure
-    // needed here — native layer handles its own SCTP buffering).
     return Promise.resolve().then(() => {
       for (const [i, frame] of frames.entries()) {
         const b64 = _toB64(frame);
@@ -357,6 +360,23 @@ export function initAndroidBridge(WebRTCMesh) {
   };
 
   // ── Native → JS callbacks ─────────────────────────────────────────────────
+
+  // Native produced an offer SDP (Android-initiator path) → forward through
+  // the signal channel to the desktop. _android:true lets the desktop log
+  // that this peer is using native Android WebRTC.
+  window._nativeRtcOffer = (peerId, sdpJson) => {
+    _log('_nativeRtcOffer — forwarding offer via signal channel for', peerId.slice(0,8));
+    const mesh = window._webrtcMesh;
+    if (!mesh) { _warn('_nativeRtcOffer — no _webrtcMesh on window!'); return; }
+    mesh.sendSignal({
+      type:     'rtc_offer',
+      targetId: peerId,
+      sdp:      JSON.parse(sdpJson),
+      senderId: mesh.myPeerId,
+      _android: true,
+    });
+    _log('_nativeRtcOffer — signal sent for', peerId.slice(0,8));
+  };
 
   // Shared DC is open → peer_ready event (mirrors _setupDC onopen).
   window._nativeRtcReady = (peerId) => {
@@ -421,7 +441,7 @@ export function initAndroidBridge(WebRTCMesh) {
       targetId: peerId,
       sdp:      JSON.parse(sdpJson),
       senderId: mesh.myPeerId,
-      _android: true,   // ← desktop reads this in handleSignal to log & track
+      _android: true,
     });
     _log('_nativeRtcAnswer — signal sent for', peerId.slice(0,8));
   };
@@ -449,7 +469,6 @@ export function initAndroidBridge(WebRTCMesh) {
     const buffer = _fromB64(b64Payload);
     _dbg('_nativeRtcChunk — decoded', buffer.byteLength, 'bytes from', peerId.slice(0,8),
       '— dispatching binary event');
-    // Deliver directly — native layer already merged chunks, no header present.
     mesh.dispatchEvent(new CustomEvent('binary', { detail: { peerId, buffer } }));
   };
 
