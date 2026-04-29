@@ -4,50 +4,102 @@
 // monkey-patches WebRTCMesh so all desktop↔Android connections use native
 // WebRTC instead of the browser stack.
 //
-// Everything else (desktop↔desktop, Android↔Android via LAN) is unchanged.
-// The JS assembler, pool logic, and binary event format are fully reused.
+// ── Binary port architecture (replaces evalJs + base64 delivery) ─────────────
+//  • MainActivity posts one end of a WebMessagePort to the page as a transferable
+//    in a window message with data === "rtc-port".
+//  • initAndroidBridge() stores the port in _rtcPort and wires port.onmessage.
+//  • Inbound frames (Kotlin→JS): port.onmessage fires with event.data as
+//    ArrayBuffer. Wire format:
+//      [36 bytes peerId ASCII, space-padded][raw frame bytes]
+//    JS slices the first 36 bytes, decodes as UTF-8, trims padding → peerId.
+//    The rest is the raw DC frame passed directly to mesh._handleFrame().
+//    No base64. No main-looper round-trip.
+//  • Outbound frames (JS→Kotlin): sendBinary / sendOnChannel post binary
+//    ArrayBuffers to the port with this header prepended:
+//      [1 byte channel type: 0x00=shared, 0x01..0x04=pool DC 0..3]
+//      [36 bytes peerId ASCII, space-padded]
+//      [frame bytes]
+//    Kotlin's WebMessageCallback receives WebMessage.data as ByteArray,
+//    routes to the correct DataChannel, and sends. Zero base64.
+//  • Fallback: if _rtcPort is not yet set (race during init), the old
+//    AndroidRtc.sendShared/sendPool/@JavascriptInterface path is used.
+//    window._nativeRtcChunk is also kept as a fallback receive path for the
+//    same race window.
 //
-// How it works
-// ────────────
-//  • _createPC(peerId)  → creates a NativeRtcBridge PC instead of RTCPeerConnection
-//  • addPeer / handleSignal → forward offer/answer/ICE through AndroidRtc.*
-//  • Native layer fires window._nativeRtc{Ready,PoolReady,Offer,Answer,Ice,Chunk,Failed}
-//    callbacks which re-enter the mesh as if they came from a real DC/PC.
+// ── Native file picker ────────────────────────────────────────────────────────
+//  • room.js / UI calls window.AndroidRtc.openFilePicker() instead of
+//    triggering an <input type=file> click. Kotlin launches the system picker.
+//  • On completion, Kotlin calls window._nativeFilePicked(jsonArrayStr) with
+//    [{token, name, mime, size}, …]. JS builds synthetic File-like objects and
+//    hands them to room.shareFile() / the existing upload flow.
+//  • JS reads file data via AndroidRtc.readFileChunk(token, offset, length)
+//    (returns base64). This keeps the Chunker.chunkFile generator pattern intact
+//    while never materialising the whole file in JS heap.
+//  • On transfer complete JS calls AndroidRtc.releaseFileToken(token).
 //
-// The shim is a no-op on desktop (window.AndroidRtc is undefined).
-//
-// ── BUG FIX (desktop→Android path) ──────────────────────────────────────────
-// Previously, handleSignal's rtc_offer branch called _origHandleSignal as a
-// fallback for non-native peers. However, _origHandleSignal itself calls
-// _createPC() when no PC exists yet — which creates a real RTCPeerConnection
-// and stores it in _pcs BEFORE this bridge can store the native sentinel.
-//
-// The patched handleSignal now owns ALL offer/answer/ice handling on Android.
-// It classifies each peer itself (native sentinel already in _pcs → native path,
-// real RTCPeerConnection already in _pcs → JS path, nothing in _pcs → create
-// native sentinel first, then native path). _origHandleSignal is only called
-// for non-WebRTC message types (LAN caps etc.).
-//
-// ── BUG FIX (Android→desktop / Android-initiator path) ──────────────────────
-// When Android's myPeerId > peerId, Android is the initiator and must create
-// and send the offer. Previously addPeer() did nothing in this branch, leaving
-// both sides waiting for the other to offer — deadlock.
-//
-// Now addPeer() calls AndroidRtc.createOffer(peerId). NativeRtcBridge.kt
-// creates the shared DC + pool DCs, generates the offer SDP, sets it as local
-// description, then fires _nativeRtcOffer. That callback (below) forwards the
-// offer through the signal channel to the desktop, completing the handshake.
+// ── _saveFile port path ───────────────────────────────────────────────────────
+//  • room.js _saveFile() detects AndroidRtc and calls AndroidRtc.saveFile()
+//    with a base64 payload (legacy). The binary port path for received files is
+//    a follow-on optimisation — for now the base64 path is preserved for save.
 
 // ── Internal log helper ───────────────────────────────────────────────────────
 const _log  = (...a) => console.log ('[android-bridge]', ...a);
 const _dbg  = (...a) => console.debug('[android-bridge]', ...a);
 const _warn = (...a) => console.warn ('[android-bridge]', ...a);
 
+// Binary port — assigned from window.onmessage when Kotlin posts "rtc-port".
+// Shared across all mesh patches so sendBinary/sendOnChannel can use it.
+let _rtcPort = null;
+
+// Set up the port receiver immediately at module load time so we don't miss
+// the postWebMessage if initAndroidBridge() is called slightly after page load.
+// The mesh reference is needed only in _nativeRtcChunk / port.onmessage, so
+// we grab window._webrtcMesh lazily inside the handler.
+window.addEventListener('message', (e) => {
+  if (e.data !== 'rtc-port') return;
+  const port = e.ports?.[0];
+  if (!port) { _warn('rtc-port message received but no port in e.ports'); return; }
+  _rtcPort = port;
+  port.start();
+
+  port.onmessage = (ev) => {
+    // Inbound binary frame: [36-byte peerId][frame]
+    const buf = ev.data;
+    if (!(buf instanceof ArrayBuffer) || buf.byteLength < 36) {
+      _warn('port.onmessage — unexpected data', typeof buf); return;
+    }
+    const peerIdRaw = new TextDecoder().decode(new Uint8Array(buf, 0, 36));
+    const peerId    = peerIdRaw.trimEnd(); // remove space padding
+    const frame     = buf.slice(36);
+
+    const mesh = window._webrtcMesh;
+    if (!mesh) { _warn('port.onmessage — no _webrtcMesh on window'); return; }
+    mesh._handleFrame(peerId, frame);
+  };
+
+  _log('✓ binary RTC port received from Kotlin');
+});
+
+// Peer-id header size used in outbound port messages.
+const _PEER_ID_HDR = 36;
+
+/** Encode outbound frame for the binary port: [channelByte][peerId36][frame] */
+function _portFrame(channelByte, peerId, frameBuffer) {
+  const frameBytes = frameBuffer instanceof ArrayBuffer ? frameBuffer : frameBuffer.buffer;
+  const out        = new ArrayBuffer(1 + _PEER_ID_HDR + frameBytes.byteLength);
+  const view       = new Uint8Array(out);
+  view[0]          = channelByte;
+  // Write peerId as ASCII, space-padded to 36 bytes.
+  const peerIdBytes = new TextEncoder().encode(peerId.padEnd(_PEER_ID_HDR));
+  view.set(peerIdBytes, 1);
+  view.set(new Uint8Array(frameBytes), 1 + _PEER_ID_HDR);
+  return out;
+}
+
 /**
  * Patch WebRTCMesh to use native Android WebRTC when window.AndroidRtc is
- * present. Must be called with the WebRTCMesh *class* (not an instance) after
- * importing it. Safe to call on desktop — it exits immediately if AndroidRtc
- * is not defined.
+ * present. Must be called with the WebRTCMesh *class* (not an instance).
+ * Safe to call on desktop — exits immediately if AndroidRtc is not defined.
  */
 export function initAndroidBridge(WebRTCMesh) {
   const _isAndroid = typeof window.AndroidRtc !== 'undefined';
@@ -55,7 +107,6 @@ export function initAndroidBridge(WebRTCMesh) {
     ? 'AndroidRtc detected — will patch WebRTCMesh'
     : 'no AndroidRtc — desktop mode, no patch applied');
   if (!_isAndroid) return;
-  // Guard: only patch once even if called multiple times (e.g. on reconnect).
   if (WebRTCMesh.prototype._androidBridgeApplied) {
     _log('already patched — skipping');
     return;
@@ -63,41 +114,23 @@ export function initAndroidBridge(WebRTCMesh) {
   WebRTCMesh.prototype._androidBridgeApplied = true;
 {
 
-  // ── Patch WebRTCMesh prototype ────────────────────────────────────────────
-
   const proto = WebRTCMesh.prototype;
 
   // ── addPeer ───────────────────────────────────────────────────────────────
-  // Replaces RTCPeerConnection creation with a native PC on Android.
-  // The peer that has the lexicographically larger id is the initiator
-  // (same rule as the original). When Android is the initiator it calls
-  // AndroidRtc.createOffer() so native creates the DCs + offer SDP and fires
-  // _nativeRtcOffer back to JS to forward via the signal channel.
   const _origAddPeer = proto.addPeer;
   proto.addPeer = async function(peerId) {
     _log('addPeer called for', peerId.slice(0,8));
-
     if (this._pcs.has(peerId)) {
       const existing = this._pcs.get(peerId);
       _log('addPeer skipped — already exists', peerId.slice(0,8),
-        '| native:', !!existing._native,
-        '| state:', existing.connectionState);
+        '| native:', !!existing._native, '| state:', existing.connectionState);
       return;
     }
-
     _log('addPeer — creating native PC for', peerId.slice(0,8));
-
-    // Sentinel so _pcs.has() / removePeer() still work.
     this._pcs.set(peerId, { _native: true, connectionState: 'new', close() {} });
-
-    // Tell native layer to create the PeerConnection.
     _log('→ AndroidRtc.createPeerConnection(', peerId.slice(0,8), ')');
     window.AndroidRtc.createPeerConnection(peerId);
-
     if (this.myPeerId > peerId) {
-      // Android is the initiator — tell native to create the offer.
-      // NativeRtcBridge.createOffer() opens the shared DC + pool DCs, generates
-      // the SDP, then fires _nativeRtcOffer which forwards it to the desktop.
       _log('addPeer — Android is initiator for', peerId.slice(0,8),
         '— calling AndroidRtc.createOffer');
       window.AndroidRtc.createOffer(peerId);
@@ -113,7 +146,6 @@ export function initAndroidBridge(WebRTCMesh) {
     const pc = this._pcs.get(peerId);
     if (pc?._native) {
       _log('removePeer (native)', peerId.slice(0,8));
-      _log('→ AndroidRtc.closePeer(', peerId.slice(0,8), ')');
       window.AndroidRtc.closePeer(peerId);
       this._pcs.delete(peerId);
       this._dcs.delete(peerId);
@@ -134,139 +166,69 @@ export function initAndroidBridge(WebRTCMesh) {
   };
 
   // ── handleSignal ──────────────────────────────────────────────────────────
-  // This method now OWNS all rtc_offer / rtc_answer / rtc_ice handling on
-  // Android. It no longer delegates to _origHandleSignal for those types.
-  //
-  // Why this matters for desktop→Android:
-  //   When a desktop peer sends rtc_offer, the base handleSignal (webrtc.js)
-  //   would have been called first (via prototype chain). It checks
-  //   _pcs.get(senderId) and, finding nothing, calls _createPC() which creates
-  //   a real RTCPeerConnection — *before* this bridge's sentinel is stored.
-  //   After that, every _native check fails because the stored object is a real
-  //   RTCPeerConnection (pc._native is undefined).
-  //
-  //   By owning the full signal dispatch here, the bridge intercepts the offer
-  //   before _origHandleSignal runs and ensures the native sentinel is always
-  //   stored first. Only non-WebRTC messages fall through to _origHandleSignal.
   const _origHandleSignal = proto.handleSignal;
   proto.handleSignal = async function(msg) {
     const { type, senderId } = msg;
-
     _dbg('handleSignal type=', type, 'from', senderId.slice(0,8));
 
-    // ── rtc_offer ─────────────────────────────────────────────────────────
     if (type === 'rtc_offer') {
       const existing = this._pcs.get(senderId);
-
-      // If a real RTCPeerConnection is already stored, this is a desktop↔desktop
-      // peer that got here before the bridge ran (shouldn't happen, but guard it).
       if (existing && !existing._native) {
         _warn('rtc_offer from', senderId.slice(0,8),
-          '— real RTCPeerConnection already in _pcs (unexpected on Android); '
-          + 'falling through to JS path');
+          '— real RTCPeerConnection already in _pcs (unexpected); falling through to JS path');
         return _origHandleSignal.call(this, msg);
       }
-
-      // If no native PC exists yet, create one now.
-      // This is the normal desktop→Android path: desktop sends the offer
-      // without us having called addPeer first.
       if (!existing) {
-        _log('rtc_offer from', senderId.slice(0,8),
-          '— no PC yet, creating native sentinel + AndroidRtc PC');
+        _log('rtc_offer from', senderId.slice(0,8), '— no PC yet, creating native sentinel');
         this._pcs.set(senderId, { _native: true, connectionState: 'new', close() {} });
-        _log('→ AndroidRtc.createPeerConnection(', senderId.slice(0,8), ')');
         window.AndroidRtc.createPeerConnection(senderId);
       } else {
-        _log('rtc_offer from', senderId.slice(0,8),
-          '— native sentinel already present (addPeer was called first)');
+        _log('rtc_offer from', senderId.slice(0,8), '— native sentinel already present');
       }
-
       _log('rtc_offer → AndroidRtc.setRemoteOffer(', senderId.slice(0,8), ')');
       window.AndroidRtc.setRemoteOffer(senderId, JSON.stringify(msg.sdp));
-
-      // ── FIX (Bug 2): flush JS-buffered ICE immediately after setRemoteOffer ──
-      // Candidates that arrived before this offer were buffered in _icePending.
-      // They must be handed to native NOW — right after the remote description
-      // has been queued on the native side — so Kotlin can buffer them in its own
-      // pendingIce list until onSetSuccess fires (which it handles internally).
       const pendingIce = this._icePending.get(senderId);
       if (pendingIce?.length) {
-        _log('rtc_offer — flushing', pendingIce.length,
-          'pre-offer ICE candidate(s) to native for', senderId.slice(0,8));
+        _log('rtc_offer — flushing', pendingIce.length, 'pre-offer ICE candidate(s)');
         this._icePending.delete(senderId);
         for (const c of pendingIce) {
-          _dbg('→ AndroidRtc.addIceCandidate (pre-offer flush)', senderId.slice(0,8));
           window.AndroidRtc.addIceCandidate(senderId, JSON.stringify(c));
         }
       }
-
       return;
     }
 
-    // ── rtc_answer ────────────────────────────────────────────────────────
     if (type === 'rtc_answer') {
       const pc = this._pcs.get(senderId);
-
-      if (!pc) {
-        _warn('rtc_answer from', senderId.slice(0,8),
-          '— no PC in _pcs at all; dropping (unexpected)');
-        return;
-      }
-
-      if (!pc._native) {
-        _dbg('rtc_answer from', senderId.slice(0,8), '— JS/browser peer, passing through');
-        return _origHandleSignal.call(this, msg);
-      }
-
-      _log('rtc_answer → AndroidRtc.setRemoteAnswer(', senderId.slice(0,8), ')');
+      if (!pc) { _warn('rtc_answer — no PC; dropping'); return; }
+      if (!pc._native) return _origHandleSignal.call(this, msg);
       window.AndroidRtc.setRemoteAnswer(senderId, JSON.stringify(msg.sdp));
       return;
     }
 
-    // ── rtc_ice ───────────────────────────────────────────────────────────
     if (type === 'rtc_ice') {
       const pc = this._pcs.get(senderId);
-
       if (!pc) {
-        // ICE can arrive before the offer (especially on fast networks).
-        // Buffer it in _icePending so it can be applied once the offer arrives.
-        _warn('rtc_ice from', senderId.slice(0,8),
-          '— no PC yet; buffering candidate in _icePending');
+        _warn('rtc_ice — no PC yet; buffering');
         if (!this._icePending.has(senderId)) this._icePending.set(senderId, []);
         if (msg.candidate) this._icePending.get(senderId).push(msg.candidate);
         return;
       }
-
-      if (!pc._native) {
-        _dbg('rtc_ice from', senderId.slice(0,8), '— JS/browser peer, passing through');
-        return _origHandleSignal.call(this, msg);
-      }
-
-      if (msg.candidate) {
-        _dbg('rtc_ice → AndroidRtc.addIceCandidate(', senderId.slice(0,8), ')');
-        window.AndroidRtc.addIceCandidate(senderId, JSON.stringify(msg.candidate));
-      } else {
-        _dbg('rtc_ice from', senderId.slice(0,8), '— end-of-candidates marker, ignoring');
-      }
+      if (!pc._native) return _origHandleSignal.call(this, msg);
+      if (msg.candidate) window.AndroidRtc.addIceCandidate(senderId, JSON.stringify(msg.candidate));
       return;
     }
 
-    // Not a WebRTC message (LAN caps etc.) — pass through.
-    _dbg('handleSignal — non-WebRTC type', type, '— passing through to base');
+    _dbg('handleSignal — non-WebRTC type', type, '— passing through');
     return _origHandleSignal.call(this, msg);
   };
 
   // ── hasChannel ────────────────────────────────────────────────────────────
-  // ── FIX (Bug 1): use isSharedReady, NOT isPoolReady ──────────────────────
-  // hasChannel() gates chat messages. Chat only needs the shared DC ("files").
-  // isPoolReady() returns false until all 4 xferp-* channels are open, which
-  // means any messages queued in _dcReady after peer_ready fires are never
-  // flushed — they sit there until the pool opens (or forever if it doesn't).
   const _origHasChannel = proto.hasChannel;
   proto.hasChannel = function(peerId) {
     const pc = this._pcs.get(peerId);
     if (pc?._native) {
-      const ready = window.AndroidRtc.isSharedReady(peerId); // ← was isPoolReady
+      const ready = window.AndroidRtc.isSharedReady(peerId);
       _dbg('hasChannel (native)', peerId.slice(0,8), '→', ready);
       return ready;
     }
@@ -274,220 +236,241 @@ export function initAndroidBridge(WebRTCMesh) {
   };
 
   // ── sendBinary (shared DC) ────────────────────────────────────────────────
+  // Binary port path: no _splitToFrames, no base64.
+  // The frame goes as a single port message. Kotlin's sendBytes() handles DC
+  // fragmentation (its splitFrame mirrors the old JS _splitToFrames).
   const _origSendBinary = proto.sendBinary;
   proto.sendBinary = async function(peerId, buffer) {
     const pc = this._pcs.get(peerId);
     if (!pc?._native) return _origSendBinary.call(this, peerId, buffer);
 
-    _dbg('sendBinary (native shared DC)', peerId.slice(0,8),
-      '| bytes:', buffer.byteLength ?? buffer.buffer?.byteLength ?? '?');
+    _dbg('sendBinary (native shared DC)', peerId.slice(0,8));
 
-    const frames = _splitToFrames(buffer);
-    _dbg('sendBinary — split into', frames.length, 'frame(s) for', peerId.slice(0,8));
-    for (const [i, frame] of frames.entries()) {
-      const b64 = _toB64(frame);
-      _dbg('sendBinary — AndroidRtc.sendShared frame', i + 1, '/', frames.length,
-        'for', peerId.slice(0,8));
-      const ok  = window.AndroidRtc.sendShared(peerId, b64);
-      if (!ok) throw new Error(`[android-bridge] sendShared failed for ${peerId.slice(0,8)}`);
+    if (_rtcPort) {
+      // Binary port: channel 0x00 = shared DC.
+      const out = _portFrame(0x00, peerId, buffer);
+      _rtcPort.postMessage(out, [out]);
+    } else {
+      // Fallback: base64 via @JavascriptInterface (port not ready yet).
+      _warn('sendBinary — port not ready, falling back to base64 sendShared');
+      const frames = _splitToFrames(buffer);
+      for (const frame of frames) {
+        const b64 = _toB64(frame);
+        const ok  = window.AndroidRtc.sendShared(peerId, b64);
+        if (!ok) throw new Error(`[android-bridge] sendShared failed for ${peerId.slice(0,8)}`);
+      }
     }
   };
 
   // ── getPoolChannels ───────────────────────────────────────────────────────
-  // Returns a Promise<proxy[]> where each proxy mimics RTCDataChannel enough
-  // for room.js to call sendOnChannel(dc, buffer) on it.
   const _origGetPoolChannels = proto.getPoolChannels;
   proto.getPoolChannels = function(peerId, timeoutMs = 10_000) {
     const pc = this._pcs.get(peerId);
     if (!pc?._native) return _origGetPoolChannels.call(this, peerId, timeoutMs);
 
     _log('getPoolChannels (native)', peerId.slice(0,8));
-
-    // Check if pool is already flagged ready.
     if (this._xferPool.has(peerId)) {
       _log('getPoolChannels (native) — pool already ready for', peerId.slice(0,8));
       return Promise.resolve(this._xferPool.get(peerId));
     }
-
-    _log('getPoolChannels (native) — waiting for _nativeRtcPoolReady callback',
-      peerId.slice(0,8), '| timeout:', timeoutMs, 'ms');
-
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        _warn('getPoolChannels (native) — TIMEOUT waiting for pool', peerId.slice(0,8));
+        _warn('getPoolChannels (native) — TIMEOUT', peerId.slice(0,8));
         this._xferPoolResolve.delete(peerId);
         reject(new Error(`[android-bridge] pool timeout ${peerId.slice(0,8)}`));
       }, timeoutMs);
-
       this._xferPoolResolve.set(peerId, pool => {
         clearTimeout(timer);
-        _log('getPoolChannels (native) — pool resolved for', peerId.slice(0,8));
         resolve(pool);
       });
-
-      // Race: pool may be ready already.
       if (this._xferPool.has(peerId)) {
         clearTimeout(timer);
         this._xferPoolResolve.delete(peerId);
-        _log('getPoolChannels (native) — pool became ready during registration',
-          peerId.slice(0,8));
         resolve(this._xferPool.get(peerId));
       }
     });
   };
 
   // ── sendOnChannel — native pool proxy ────────────────────────────────────
-  // room.js calls: await mesh.sendOnChannel(pool[i], buffer)
-  // pool[i] is a NativePoolProxy (see _nativeRtcPoolReady below).
+  // Binary port path: channel byte 0x01..0x04 = pool DC index 0..3.
+  // No _splitToFrames, no base64. Kotlin handles DC fragmentation.
   const _origSendOnChannel = proto.sendOnChannel;
   proto.sendOnChannel = function(dc, buffer) {
     if (!dc._nativePool) return _origSendOnChannel.call(this, dc, buffer);
 
     const { peerId, index } = dc._nativePool;
-    const frames = _splitToFrames(buffer);
-    _dbg('sendOnChannel (native pool)', peerId.slice(0,8),
-      '| channel index:', index,
-      '| frames:', frames.length);
+    _dbg('sendOnChannel (native pool)', peerId.slice(0,8), '| channel index:', index);
 
     return Promise.resolve().then(() => {
-      for (const [i, frame] of frames.entries()) {
-        const b64 = _toB64(frame);
-        _dbg('sendOnChannel → AndroidRtc.sendPool', peerId.slice(0,8),
-          '| pool index:', index, '| frame:', i + 1, '/', frames.length);
-        window.AndroidRtc.sendPool(peerId, index, b64);
+      if (_rtcPort) {
+        // Binary port: channel byte 0x01..0x04 for pool index 0..3.
+        const channelByte = 0x01 + index;
+        const out = _portFrame(channelByte, peerId, buffer);
+        _rtcPort.postMessage(out, [out]);
+      } else {
+        // Fallback: base64 via @JavascriptInterface.
+        _warn('sendOnChannel — port not ready, falling back to base64 sendPool');
+        const frames = _splitToFrames(buffer);
+        for (const frame of frames) {
+          const b64 = _toB64(frame);
+          window.AndroidRtc.sendPool(peerId, index, b64);
+        }
       }
     });
   };
 
   // ── Native → JS callbacks ─────────────────────────────────────────────────
 
-  // Native produced an offer SDP (Android-initiator path) → forward through
-  // the signal channel to the desktop. _android:true lets the desktop log
-  // that this peer is using native Android WebRTC.
   window._nativeRtcOffer = (peerId, sdpJson) => {
-    _log('_nativeRtcOffer — forwarding offer via signal channel for', peerId.slice(0,8));
+    _log('_nativeRtcOffer — forwarding offer for', peerId.slice(0,8));
     const mesh = window._webrtcMesh;
-    if (!mesh) { _warn('_nativeRtcOffer — no _webrtcMesh on window!'); return; }
-    mesh.sendSignal({
-      type:     'rtc_offer',
-      targetId: peerId,
-      sdp:      JSON.parse(sdpJson),
-      senderId: mesh.myPeerId,
-      _android: true,
-    });
-    _log('_nativeRtcOffer — signal sent for', peerId.slice(0,8));
+    if (!mesh) { _warn('_nativeRtcOffer — no _webrtcMesh'); return; }
+    mesh.sendSignal({ type: 'rtc_offer', targetId: peerId, sdp: JSON.parse(sdpJson), senderId: mesh.myPeerId, _android: true });
   };
 
-  // Shared DC is open → peer_ready event (mirrors _setupDC onopen).
   window._nativeRtcReady = (peerId) => {
     _log('_nativeRtcReady — shared DC open for', peerId.slice(0,8));
     const mesh = window._webrtcMesh;
-    if (!mesh) { _warn('_nativeRtcReady — no _webrtcMesh on window!'); return; }
-
-    // Synthesise a minimal shared DC proxy for hasChannel / sendBinary.
-    const fakeSharedDc = { readyState: 'open', _nativePeer: peerId };
-    mesh._dcs.set(peerId, fakeSharedDc);
-
-    // NOTE: Pre-offer ICE candidates are now flushed immediately in handleSignal's
-    // rtc_offer branch (Bug 2 fix), so nothing to do here for _icePending.
-    // Guard retained for safety: if somehow candidates slipped through, log and
-    // forward them now rather than silently losing them.
+    if (!mesh) { _warn('_nativeRtcReady — no _webrtcMesh'); return; }
+    mesh._dcs.set(peerId, { readyState: 'open', _nativePeer: peerId });
     const leftoverIce = mesh._icePending.get(peerId);
     if (leftoverIce?.length) {
-      _warn('_nativeRtcReady — unexpected leftover ICE candidates for', peerId.slice(0,8),
-        '(should have been flushed in handleSignal rtc_offer branch) — flushing now');
+      _warn('_nativeRtcReady — flushing leftover ICE for', peerId.slice(0,8));
       mesh._icePending.delete(peerId);
-      for (const c of leftoverIce) {
-        _dbg('→ AndroidRtc.addIceCandidate (leftover flush)', peerId.slice(0,8));
-        window.AndroidRtc.addIceCandidate(peerId, JSON.stringify(c));
-      }
+      for (const c of leftoverIce) window.AndroidRtc.addIceCandidate(peerId, JSON.stringify(c));
     }
-
-    // Flush any queued DC-ready callbacks.
     const q = mesh._dcReady.get(peerId) || [];
     mesh._dcReady.delete(peerId);
-    if (q.length) _log('_nativeRtcReady — flushing', q.length, 'dcReady callback(s)');
     q.forEach(fn => fn());
-
-    _log('_nativeRtcReady — dispatching peer_ready for', peerId.slice(0,8));
     mesh.dispatchEvent(new CustomEvent('peer_ready', { detail: { peerId } }));
   };
 
-  // All 4 pool DCs open → build proxy array and resolve getPoolChannels.
   window._nativeRtcPoolReady = (peerId) => {
     _log('_nativeRtcPoolReady — all pool DCs open for', peerId.slice(0,8));
     const mesh = window._webrtcMesh;
-    if (!mesh) { _warn('_nativeRtcPoolReady — no _webrtcMesh on window!'); return; }
-
+    if (!mesh) { _warn('_nativeRtcPoolReady — no _webrtcMesh'); return; }
     const pool = Array.from({ length: 4 }, (_, i) => ({
       _nativePool: { peerId, index: i },
       label: `xferp-${i}`,
       readyState: 'open',
     }));
-    _log('_nativeRtcPoolReady — pool proxy array built (4 channels) for', peerId.slice(0,8));
     mesh._xferPool.set(peerId, pool);
     mesh._xferPoolResolve.get(peerId)?.(pool);
     mesh._xferPoolResolve.delete(peerId);
   };
 
-  // Native layer produced an answer SDP → forward through the signal channel.
-  // _android:true lets the desktop log "this peer is Android, native WebRTC path active".
   window._nativeRtcAnswer = (peerId, sdpJson) => {
-    _log('_nativeRtcAnswer — forwarding answer via signal channel for', peerId.slice(0,8));
+    _log('_nativeRtcAnswer — forwarding answer for', peerId.slice(0,8));
     const mesh = window._webrtcMesh;
-    if (!mesh) { _warn('_nativeRtcAnswer — no _webrtcMesh on window!'); return; }
-    mesh.sendSignal({
-      type:     'rtc_answer',
-      targetId: peerId,
-      sdp:      JSON.parse(sdpJson),
-      senderId: mesh.myPeerId,
-      _android: true,
-    });
-    _log('_nativeRtcAnswer — signal sent for', peerId.slice(0,8));
+    if (!mesh) { _warn('_nativeRtcAnswer — no _webrtcMesh'); return; }
+    mesh.sendSignal({ type: 'rtc_answer', targetId: peerId, sdp: JSON.parse(sdpJson), senderId: mesh.myPeerId, _android: true });
   };
 
-  // Native ICE candidate → forward through the signal channel.
   window._nativeRtcIce = (peerId, candidateJson) => {
-    _dbg('_nativeRtcIce — forwarding ICE candidate via signal channel for', peerId.slice(0,8));
     const mesh = window._webrtcMesh;
-    if (!mesh) { _warn('_nativeRtcIce — no _webrtcMesh on window!'); return; }
-    mesh.sendSignal({
-      type:      'rtc_ice',
-      targetId:  peerId,
-      candidate: JSON.parse(candidateJson),
-      senderId:  mesh.myPeerId,
-    });
+    if (!mesh) return;
+    mesh.sendSignal({ type: 'rtc_ice', targetId: peerId, candidate: JSON.parse(candidateJson), senderId: mesh.myPeerId });
   };
 
-  // Inbound binary frame from native DC → feed into the JS transport assembler.
-  //
-  // Kotlin delivers raw 64 KB transport frames immediately (no native reassembly).
-  // Each frame has the standard 12-byte transport header:
-  //   [transferId u32le][total u32le][index u32le][payload...]
-  //
-  // Route through mesh._handleFrame() — the same reassembler the desktop DC path
-  // uses — so multi-frame transfers are merged before room.js sees them.
-  //
-  // No per-frame logging: this fires once per 64 KB frame. console.debug on
-  // Android WebView is synchronous and measurably throttles throughput at speed.
+  // Fallback receive path: used when the binary port is not yet set up.
+  // Once _rtcPort is wired, port.onmessage at the top of this file handles
+  // all frames directly and this callback is never called for new peers.
   window._nativeRtcChunk = (peerId, b64Payload) => {
+    if (_rtcPort) return; // already handled by port.onmessage — shouldn't fire
     const mesh = window._webrtcMesh;
-    if (!mesh) { _warn('_nativeRtcChunk — no _webrtcMesh on window!'); return; }
+    if (!mesh) { _warn('_nativeRtcChunk — no _webrtcMesh'); return; }
     mesh._handleFrame(peerId, _fromB64(b64Payload));
   };
 
-  // Native PC failed/closed.
   window._nativeRtcFailed = (peerId) => {
-    _warn('_nativeRtcFailed — native PC failed/closed for', peerId.slice(0,8));
+    _warn('_nativeRtcFailed — native PC failed for', peerId.slice(0,8));
     const mesh = window._webrtcMesh;
-    if (!mesh) { _warn('_nativeRtcFailed — no _webrtcMesh on window!'); return; }
-    _warn('_nativeRtcFailed — dispatching peer_failed + removePeer for', peerId.slice(0,8));
+    if (!mesh) return;
     mesh.dispatchEvent(new CustomEvent('peer_failed', { detail: { peerId } }));
     mesh.removePeer(peerId);
   };
 
-  // ── Frame helpers (mirrors JS _sendOnDC wire format) ──────────────────────
-  // 12-byte header: [transferId u32le][total u32le][index u32le] + payload
+  // ── Native file picker callbacks ──────────────────────────────────────────
+
+  /**
+   * Kotlin calls this when the system file picker returns.
+   * files: JSON array string of [{token, name, mime, size}, …]
+   *
+   * Constructs NativeFile objects (match the File API subset used by room.js
+   * Chunker.chunkFile + shareFile) and dispatches them to the upload flow.
+   * JS reads file data via AndroidRtc.readFileChunk(token, offset, length).
+   */
+  window._nativeFilePicked = (files) => {
+    _log('_nativeFilePicked count=', files.length);
+    // Dispatch a synthetic CustomEvent so any UI layer can subscribe.
+    // room.js / app.js should listen for 'native-files-picked' and call
+    // room.shareFile(nativeFile) for each entry.
+    window.dispatchEvent(new CustomEvent('native-files-picked', {
+      detail: { files: files.map(f => new NativeFile(f)) }
+    }));
+  };
+
+  /**
+   * NativeFile — a File-API-compatible wrapper around a Kotlin-side picked file.
+   * Supports .name, .size, .type (all File properties used by room.js).
+   * Supports arrayBuffer() and slice() used by Chunker.chunkFile — both
+   * implemented via AndroidRtc.readFileChunk (base64 per-chunk).
+   *
+   * IMPORTANT: Chunker.chunkFile() calls slice() to read ranges. We implement
+   * slice() to return a NativeBlob that reads the given byte range on demand via
+   * readFileChunk. This means file data is read in chunks, never fully in heap.
+   */
+  class NativeFile {
+    constructor({ token, name, mime, size }) {
+      this._token = token;
+      this.name   = name;
+      this.size   = size;
+      this.type   = mime;
+      this.lastModified = Date.now();
+    }
+
+    /** Read this.size bytes starting at 0 — used by Chunker for small files. */
+    async arrayBuffer() {
+      return _readNativeRange(this._token, 0, this.size);
+    }
+
+    /** Mimic Blob.slice — Chunker.chunkFile calls file.slice(start, end). */
+    slice(start = 0, end = this.size) {
+      return new NativeBlob(this._token, start, end - start, this.type);
+    }
+
+    /** Release the Kotlin-side token when done. */
+    release() {
+      window.AndroidRtc.releaseFileToken(this._token);
+    }
+  }
+
+  class NativeBlob {
+    constructor(token, offset, length, type) {
+      this._token  = token;
+      this._offset = offset;
+      this._length = length;
+      this.size    = length;
+      this.type    = type;
+    }
+    async arrayBuffer() {
+      return _readNativeRange(this._token, this._offset, this._length);
+    }
+  }
+
+  /**
+   * Read [length] bytes starting at [offset] from a picked file via Kotlin.
+   * Returns an ArrayBuffer. Kotlin returns base64 (per-call cost acceptable
+   * because Chunker.chunkFile reads at most one chunk per call).
+   */
+  async function _readNativeRange(token, offset, length) {
+    if (length <= 0) return new ArrayBuffer(0);
+    const b64 = window.AndroidRtc.readFileChunk(token, offset, length);
+    if (!b64) return new ArrayBuffer(0);
+    return _fromB64(b64);
+  }
+
+  // ── Frame helpers (fallback base64 path only) ─────────────────────────────
 
   const DC_CHUNK = 64 * 1024;
 
@@ -518,12 +501,12 @@ export function initAndroidBridge(WebRTCMesh) {
   }
 
   function _fromB64(b64) {
-    const bin    = atob(b64);
-    const bytes  = new Uint8Array(bin.length);
+    const bin   = atob(b64);
+    const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     return bytes.buffer;
   }
 
-  _log('✓ WebRTCMesh patched for native WebRTC');
+  _log('✓ WebRTCMesh patched for native WebRTC (binary port path active)');
 } // end _isAndroid block
 } // end initAndroidBridge

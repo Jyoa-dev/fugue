@@ -298,6 +298,46 @@ export class Room {
 
     this._onBeforeUnload = () => this.leave();
     window.addEventListener('beforeunload', this._onBeforeUnload);
+
+    this._initNativeFilePicker();
+  }
+
+  _initNativeFilePicker() {
+    if (typeof window.AndroidRtc === 'undefined') return;
+
+    // Listen for files delivered by the Kotlin native picker.
+    // webrtc_android_bridge.js wraps them as NativeFile objects and dispatches
+    // this event so room.js (and any UI layer) can consume them uniformly.
+    window.addEventListener('native-files-picked', (e) => {
+      const { files } = e.detail;
+      if (!files?.length) return;
+      for (const nativeFile of files) {
+        // shareFile() expects a File-like object with .name .size .type and
+        // either .arrayBuffer() or .slice() — NativeFile provides both.
+        this.shareFile(nativeFile).catch(err => {
+          console.error('[room] shareFile(NativeFile) failed:', err);
+        }).finally(() => {
+          // Release the Kotlin-side ContentResolver reference when done.
+          nativeFile.release?.();
+        });
+      }
+    });
+  }
+
+  openNativeFilePicker() {
+    if (typeof window.AndroidRtc !== 'undefined' && window.AndroidRtc.openFilePicker) {
+      window.AndroidRtc.openFilePicker();
+    } else {
+      // Desktop fallback: trigger a hidden file input.
+      const input     = document.createElement('input');
+      input.type      = 'file';
+      input.multiple  = true;
+      input.onchange  = () => {
+        if (!input.files?.length) return;
+        for (const f of input.files) this.shareFile(f).catch(console.error);
+      };
+      input.click();
+    }
   }
 
   // ── WebRTC ──────────────────────────────────────────────────────────────
@@ -774,21 +814,41 @@ export class Room {
     const b    = blob instanceof Blob ? blob : new Blob([blob], { type: meta?.mimeType || 'application/octet-stream' });
     const name = meta?.name || 'download';
 
-    // On Android, hand the blob off to the native layer so it can write to
-    // the Downloads directory via MediaStore — anchor-click is a no-op in the
-    // embedded WebView.
+    // On Android, save via the native Kotlin layer (MediaStore / Downloads).
+    // Convert to ArrayBuffer first — avoids the double-allocation of
+    // FileReader.readAsDataURL (which wraps bytes in a data-URL string).
+    // The resulting base64 string is the same size regardless of conversion
+    // method; we just avoid the FileReader async callback and data-URL prefix.
     if (typeof window.AndroidRtc !== 'undefined' && window.AndroidRtc.saveFile) {
-      const reader = new FileReader();
-      reader.onload = () => {
-        // reader.result is a data-URL; strip the prefix to get raw base64.
-        const b64 = reader.result.split(',')[1];
+      // Use FileReader with readAsArrayBuffer → Uint8Array → btoa.
+      // For previewable files we still need a Blob URL for the preview — create
+      // it before we hand the bytes to Kotlin (no second conversion needed).
+      const previewUrl = isPreviewable(meta?.mimeType, name)
+        ? URL.createObjectURL(b)
+        : null;
+
+      b.arrayBuffer().then(buf => {
+        const bytes  = new Uint8Array(buf);
+        // btoa requires a binary string — use a typed-array loop (fastest on V8).
+        let   bin    = '';
+        for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+        const b64    = btoa(bin);
         window.AndroidRtc.saveFile(name, meta?.mimeType || 'application/octet-stream', b64);
-      };
-      reader.readAsDataURL(b);
-      if (isPreviewable(meta?.mimeType, name)) return URL.createObjectURL(b);
-      return null;
+      }).catch(err => {
+        console.error('[_saveFile] arrayBuffer() failed:', err);
+        // Fallback to old FileReader path if arrayBuffer() is somehow unavailable.
+        const reader  = new FileReader();
+        reader.onload = () => {
+          const b64 = reader.result.split(',')[1];
+          window.AndroidRtc.saveFile(name, meta?.mimeType || 'application/octet-stream', b64);
+        };
+        reader.readAsDataURL(b);
+      });
+
+      return previewUrl; // null for non-previewable — correct behaviour
     }
 
+    // Desktop / non-Android path — unchanged.
     const url = URL.createObjectURL(b);
     Object.assign(document.createElement('a'), { href: url, download: name }).click();
     if (isPreviewable(meta?.mimeType, name)) return url;
