@@ -141,7 +141,15 @@ export class WebRTCMesh extends EventTarget {
     this._dcReady.delete(peerId);
     this._icePending.delete(peerId);
     const pool = this._xferPool.get(peerId);
-    if (pool) { pool.forEach(dc => { try { dc.close(); } catch {} }); }
+    if (pool) {
+      pool.forEach(dc => {
+        // Flush write queue first so any awaiting sendOnChannel callers unblock
+        // before the DC closes — otherwise they hang until GC.
+        const q = this._writeQueues.get(dc);
+        if (q) { while (q.pending.length > 0) q.pending.shift().resolve(); }
+        try { dc.close(); } catch {}
+      });
+    }
     this._xferPool.delete(peerId);
     this._xferPoolResolve.delete(peerId); // abandons any pending getPoolChannels (timer rejects)
     this._xferPoolBuf.delete(peerId);
@@ -202,7 +210,16 @@ export class WebRTCMesh extends EventTarget {
       }
       const { buffer, resolve } = q.pending.shift();
       resolve();                        // unblock caller immediately
-      await this._sendOnDC(dc, buffer); // SCTP drain — blocks only this channel's loop
+      const ok = await this._sendOnDC(dc, buffer);
+      if (ok === false) {
+        // DC stalled or closed — flush remaining queue so callers don't hang,
+        // then exit. The connection will fail/close through normal peer_failed path.
+        if (q.pending.length > 0) {
+          console.warn('[queue]', dc.label, '— flushing', q.pending.length, 'pending items after abort');
+          while (q.pending.length > 0) q.pending.shift().resolve();
+        }
+        break;
+      }
     }
     q.running = false;
   }
@@ -213,6 +230,7 @@ export class WebRTCMesh extends EventTarget {
     if (type === 'rtc_offer') {
       let pc = this._pcs.get(senderId);
       if (!pc) pc = this._createPC(senderId);
+      if (pc._native) return; // handed off to webrtc_android_bridge.js
       if (pc.signalingState !== 'stable') return;
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
@@ -233,6 +251,7 @@ export class WebRTCMesh extends EventTarget {
 
     if (type === 'rtc_answer') {
       const pc = this._pcs.get(senderId);
+      if (pc?._native) return; // handed off to webrtc_android_bridge.js
       if (pc && pc.signalingState === 'have-local-offer') {
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
@@ -250,6 +269,7 @@ export class WebRTCMesh extends EventTarget {
 
     if (type === 'rtc_ice') {
       const pc = this._pcs.get(senderId);
+      if (pc?._native) return; // handed off to webrtc_android_bridge.js
       if (pc && msg.candidate) {
         if (!pc.remoteDescription) {
           if (!this._icePending.has(senderId)) this._icePending.set(senderId, []);
@@ -454,6 +474,16 @@ export class WebRTCMesh extends EventTarget {
       if (dc.bufferedAmount > high) {
         await this._drainBuffer(dc);
       }
+      // If drain force-resolved due to a stall (SCTP flow-control), the buffer
+      // may still be above the high watermark. Skip this frame rather than
+      // pushing more data into a stuck pipe — the caller will get an error or
+      // the DC will close, which is the correct failure signal.
+      if (dc.readyState !== 'open') return false;
+      if (dc.bufferedAmount > high * 2) {
+        console.warn('[send] aborting', dc.label,
+          '— buffer still', (dc.bufferedAmount/1024).toFixed(0), 'KB after stall');
+        return false; // signals _runDCQueue to abort this DC's loop
+      }
       this._xferDiag.bytesSent += frame.byteLength;
       dc.send(frame);
     }
@@ -476,9 +506,10 @@ export class WebRTCMesh extends EventTarget {
     // Resume at high/2 so the sender wakes while there is still headroom —
     // avoids the "fill to high, idle until high" pattern that causes long stalls.
     const resume = Math.max(DC_CHUNK, (high / 2) | 0);
+    let forceResolved = false;
     await new Promise(r => {
       let done = false;
-      const resolve = () => {
+      const resolve = (reason) => {
         if (done) return;
         done = true;
         clearTimeout(hangTimer);
@@ -487,21 +518,40 @@ export class WebRTCMesh extends EventTarget {
       };
       dc.bufferedAmountLowThreshold = resume;
       dc.addEventListener('bufferedamountlow', resolve, { once: true });
-      // Polling fallback: Safari iOS does not reliably fire bufferedamountlow.
+      // Polling fallback: Safari/WebView does not reliably fire bufferedamountlow.
+      // Also detects SCTP flow-control stalls: if bufferedAmount stops decreasing
+      // for 500 ms we force-resolve rather than blocking indefinitely.
+      let lastBuffered = dc.bufferedAmount;
+      let stalledTicks = 0;
       const poll = setInterval(() => {
-        if (dc.readyState !== 'open' || dc.bufferedAmount <= resume) {
+        const cur = dc.bufferedAmount;
+        if (dc.readyState !== 'open' || cur <= resume) {
           dc.removeEventListener('bufferedamountlow', resolve);
-          resolve();
+          resolve('poll-drained');
+          return;
         }
+        if (cur >= lastBuffered) {
+          stalledTicks++;
+          if (stalledTicks >= 10) { // 10 × 50 ms = 500 ms with no progress
+            console.warn('[drain] SCTP stall on', dc.label,
+              '| buffered:', cur, 'B unchanged for 500 ms — force-resolving');
+            forceResolved = true;
+            dc.removeEventListener('bufferedamountlow', resolve);
+            resolve('stall');
+          }
+        } else {
+          stalledTicks = 0; // progress resumed — reset counter
+        }
+        lastBuffered = cur;
       }, 50);
-      // After 5 s the hang is real; force the threshold to BUF_MIN so the
-      // next poll tick unblocks the channel instead of waiting indefinitely.
       const hangTimer = setTimeout(() => {
         console.warn('[drain] bufferedamountlow never fired after 5 s',
           '| dc:', dc.label, '| state:', dc.readyState,
           '| buffered:', dc.bufferedAmount, '| high:', high);
         budget._bufHigh = BUF_MIN;
-        dc.bufferedAmountLowThreshold = BUF_MIN;
+        forceResolved = true;
+        dc.removeEventListener('bufferedamountlow', resolve);
+        resolve('hang');
       }, 5_000);
     });
     const elapsed = performance.now() - t0;

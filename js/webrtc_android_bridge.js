@@ -1,11 +1,4 @@
 // ── webrtc_android_bridge.js ─────────────────────────────────────────────────
-// Import this AFTER webrtc.js. When running inside the Android WebView with
-// window.AndroidRtc present, it monkey-patches WebRTCMesh so all
-// desktop↔Android connections use native WebRTC instead of the browser stack.
-//
-// Everything else (desktop↔desktop, Android↔Android via LAN) is unchanged.
-// The JS assembler, pool logic, and binary event format are fully reused.
-//
 // How it works
 // ────────────
 //  • _createPC(peerId)  → creates a NativeRtcBridge PC instead of RTCPeerConnection
@@ -254,13 +247,14 @@ if (_isAndroid) {
   };
 
   // Inbound binary frame from native DC → synthesise the 'binary' CustomEvent.
-  // payload is a raw b64-encoded frame (already reassembled by native if needed).
+  // Native Kotlin has already reassembled multi-chunk transfers, so the payload
+  // here is the final merged buffer with NO 12-byte header — dispatch directly.
   window._nativeRtcChunk = (peerId, b64Payload) => {
     const mesh = window._webrtcMesh;
     if (!mesh) return;
     const buffer = _fromB64(b64Payload);
-    // Feed through the existing JS assembler so partial frames (if any) merge correctly.
-    mesh._handleFrame(peerId, buffer);
+    // Deliver directly — native layer already merged chunks, no header present.
+    mesh.dispatchEvent(new CustomEvent('binary', { detail: { peerId, buffer } }));
   };
 
   // Native PC failed/closed.
