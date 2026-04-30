@@ -93,6 +93,7 @@ export function initAndroidBridge(WebRTCMesh) {
       window.AndroidRtc.closePeer(peerId);
       this._pcs.delete(peerId);
       this._dcs.delete(peerId);
+      this._androidDcs.delete(peerId);
       this._dcReady.delete(peerId);
       this._icePending.delete(peerId);
       this._xferPool.delete(peerId);

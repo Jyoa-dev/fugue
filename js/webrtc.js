@@ -74,6 +74,8 @@ export class WebRTCMesh extends EventTarget {
     this._pcs          = new Map();
     /** @type {Map<string, RTCDataChannel>} */
     this._dcs          = new Map(); // shared 'files' DC per peer (chat + signaling)
+    /** @type {Map<string, RTCDataChannel>} */
+    this._androidDcs   = new Map(); // ordered DC per peer — sendDirect (Android large frames)
     /** @type {Map<string, Array<()=>void>>} */
     this._dcReady      = new Map();
     /** @type {Map<string, { total:number, frags:ArrayBuffer[], received:number, peerId:string }>} */
@@ -142,6 +144,11 @@ export class WebRTCMesh extends EventTarget {
     if (this.myPeerId > peerId) {
       const dc = pc.createDataChannel('files', { ordered: false });
       this._setupDC(peerId, dc);
+      // Ordered DC for Android direct sends — avoids SCTP reordering stalls on
+      // large (256 KB) frames. The 'files' DC stays unordered for chat/signaling.
+      // Created before the offer so both channels are negotiated in one SDP round-trip.
+      const adc = pc.createDataChannel('android-direct', { ordered: true });
+      this._setupAndroidDC(peerId, adc);
       // Pre-open the transfer pool — all created before the offer so the
       // SDP carries all streams in one round-trip with no extra negotiation.
       this._openPool(peerId, pc);
@@ -159,6 +166,7 @@ export class WebRTCMesh extends EventTarget {
     this._pcs.get(peerId)?.close();
     this._pcs.delete(peerId);
     this._dcs.delete(peerId);
+    this._androidDcs.delete(peerId);
     this._dcReady.delete(peerId);
     this._icePending.delete(peerId);
     const pool = this._xferPool.get(peerId);
@@ -196,17 +204,18 @@ export class WebRTCMesh extends EventTarget {
   // Direct send for Android native peers — NO transport wrapper, NO splitting.
   // Android's SCTP stack (libwebrtc) delivers complete messages via onMessage()
   // transparently, so Kotlin parseDCFrame() receives the raw app frame directly.
-  // dc.send() max message size is 65535 bytes (Chrome/libwebrtc default); the
-  // caller (room.js) must cap frame size to ≤ 65535 bytes (64 KB app chunks
-  // + 26-byte header + 28-byte AES-GCM overhead = well within this limit).
-  // Uses the shared 'files' DC (same as sendBinary) — no pool needed for Android.
+  // Uses the dedicated 'android-direct' DC (ordered:true) to avoid SCTP reordering
+  // stalls that occur when 256 KB frames are sent on an unordered channel — a single
+  // lost/late packet causes multi-second head-of-line blocking at the OS buffer level.
+  // Falls back to the shared 'files' DC for peers that pre-date the android-direct
+  // channel (older desktop builds that haven't re-negotiated).
   //
   // Queued: resolves the moment the buffer is dequeued, not when it drains.
-  // This lets room.js lanes race ahead on crypto work while the single shared DC
-  // drains — same contract as sendOnChannel. Without this, all 32 lanes block
-  // simultaneously in _drainBuffer on a slow link, serialising the crypto pool.
+  // This lets room.js lanes race ahead on crypto work while the DC drains —
+  // same contract as sendOnChannel. Without this, all lanes block simultaneously
+  // in _drainBuffer on a slow link, serialising the crypto pool.
   sendDirect(peerId, buffer) {
-    const dc = this._dcs.get(peerId);
+    const dc = this._androidDcs.get(peerId) ?? this._dcs.get(peerId);
     if (!dc || dc.readyState !== 'open') throw new Error(`No open DC to ${peerId}`);
     const bytes = buffer instanceof ArrayBuffer ? buffer : buffer.buffer;
     const d = this._xferDiag;
@@ -517,6 +526,8 @@ export class WebRTCMesh extends EventTarget {
         };
         if (channel.readyState === 'open') onOpen();
         else channel.onopen = onOpen;
+      } else if (channel.label === 'android-direct') {
+        this._setupAndroidDC(peerId, channel);
       } else {
         this._setupDC(peerId, channel);
       }
@@ -565,6 +576,23 @@ export class WebRTCMesh extends EventTarget {
       if (!s || s === 'closed' || s === 'failed') return;
       console.warn('DC error', peerId, e);
     };
+  }
+
+  // Ordered DC for Android direct sends (label 'android-direct', ordered:true).
+  // Kept separate from _dcs so chat/signaling on 'files' remains unordered.
+  // No peer_ready dispatch — _setupDC fires that when 'files' opens (always first).
+  _setupAndroidDC(peerId, dc) {
+    this._androidDcs.set(peerId, dc);
+    dc.binaryType = 'arraybuffer';
+    dc._bufHigh   = initialBufHigh();
+    dc._peerId    = peerId;
+    dc.onclose = () => { this._androidDcs.delete(peerId); };
+    dc.onerror = e => {
+      const s = this._pcs.get(peerId)?.connectionState;
+      if (!s || s === 'closed' || s === 'failed') return;
+      console.warn('[android-direct] DC error', peerId, e);
+    };
+    dc.onopen = () => console.log('[android-direct] DC open for', peerId.slice(0, 8));
   }
 
   _handleFrame(peerId, data) {
