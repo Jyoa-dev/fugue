@@ -818,36 +818,7 @@ export class Room {
     // Pre-encode fileId bytes once (saves 16 parseInt calls per chunk).
     const fileIdBytes = uuidToBytes(fileId);
 
-    // _androidPeers is populated by webrtc.js when it receives _android:true
-    // in the rtc_offer (responder path) or rtc_answer (initiator path).
-    const isAndroidPeer = this._rtc._androidPeers?.has(requesterId) === true;
-
-    // ── Android chunk size cap ────────────────────────────────────────────
-    // For Android native peers we bypass _sendOnDC's transport wrapper entirely
-    // (sendDirect calls dc.send() once per app frame). NativeRtcBridge.kt sets
-    // DC_CHUNK = 256 KB so libwebrtc is configured to accept frames up to that
-    // size. Cap plaintext at 256 KB - 54 (26-byte DC header + 28-byte AES-GCM
-    // overhead) = 262 090 bytes so the framed message stays exactly at DC_CHUNK.
-    // Desktop-to-desktop transfers are unaffected: they use _sendOnDC which splits
-    // automatically and the receiver reassembles via _handleFrame.
     const ANDROID_CHUNK_CAP = 256 * 1024 - 54; // 262 090 bytes — matches DC_CHUNK in NativeRtcBridge.kt
-    const effectiveChunkSize = isAndroidPeer
-      ? Math.min(entry.chunkSize, ANDROID_CHUNK_CAP)
-      : entry.chunkSize;
-
-    // Seed the shared DC's send budget at the floor when targeting an Android peer.
-    // initialBufHigh() reflects the desktop's own link (wifi → 1 MB, default 256 KB)
-    // but Android receives on a slower SCTP stack. Starting high means the adaptive
-    // loop must shrink through several painful drain cycles before converging.
-    // Starting at BUF_MIN (32 KB) lets it grow upward from the first fast drain —
-    // one small stall on chunk 1 instead of multiple large stalls early in the file.
-    if (isAndroidPeer) {
-      const dc = this._rtc._androidDcs?.get(requesterId) ?? this._rtc._dcs?.get(requesterId);
-      if (dc && dc._bufHigh > 32 * 1024) {
-        dc._bufHigh = 32 * 1024; // BUF_MIN — will grow via _drainBuffer adaptation
-        console.log('[sendChunks] Android peer — seeding dc._bufHigh at BUF_MIN for', requesterId.slice(0, 8));
-      }
-    }
 
     // ── LAN fast-path (files ≥ 5 MB, Android only) ───────────────────────
     // Attempt TCP over Wi-Fi Direct or LAN before falling through to WebRTC DC.
@@ -859,6 +830,33 @@ export class Room {
       console.log('[lan] file is', (entry.file.size / 1024 / 1024).toFixed(1), 'MB — attempting LAN connect to', requesterId.slice(0, 8));
       useLan = await this._waitForLanReady(requesterId, 10_000);
       console.log('[lan] useLan =', useLan);
+    }
+
+    // ── Android peer detection — evaluated AFTER pool/peer handshake ──────
+    // _androidPeers is populated when the WebRTC offer/answer is processed.
+    // file_request can arrive over the relay before the WebRTC handshake
+    // completes, so reading _androidPeers before getPoolChannels (which waits
+    // for the connection to be live) would race and return false for Android
+    // peers. All Android-dependent values are derived here, after the awaits.
+    const isAndroidPeer = this._rtc._androidPeers?.has(requesterId) === true;
+    console.log('[sendChunks] isAndroidPeer:', isAndroidPeer, 'for', requesterId.slice(0, 8));
+
+    // ── Android chunk size cap ────────────────────────────────────────────
+    // For Android native peers we bypass _sendOnDC's transport wrapper entirely
+    // (sendDirect calls dc.send() once per app frame). NativeRtcBridge.kt sets
+    // DC_CHUNK = 256 KB so libwebrtc is configured to accept frames up to that
+    // size. Cap plaintext at 256 KB - 54 (26-byte DC header + 28-byte AES-GCM
+    // overhead) = 262 090 bytes so the framed message stays exactly at DC_CHUNK.
+    // Desktop-to-desktop transfers are unaffected: they use _sendOnDC which splits
+    // automatically and the receiver reassembles via _handleFrame.
+    const effectiveChunkSize = isAndroidPeer
+      ? Math.min(entry.chunkSize, ANDROID_CHUNK_CAP)
+      : entry.chunkSize;
+
+    // Seed log — _setupAndroidDC initialises _bufHigh at BUF_MIN already.
+    if (isAndroidPeer) {
+      console.log('[sendChunks] Android peer — android-direct DC ready for', requesterId.slice(0, 8),
+        '| bufHigh:', (this._rtc._androidDcs?.get(requesterId)?._bufHigh ?? 0) / 1024, 'KB');
     }
 
     const sendOne = async (chunk) => {
@@ -890,30 +888,23 @@ export class Room {
       }
 
       if (isAndroidPeer) {
-        // sendDirect: raw dc.send() with no _sendOnDC transport wrapper.
-        // Kotlin's parseDCFrame() sees the app frame bytes starting at offset 0.
-        await this._rtc.sendDirect(requesterId, frame);
-        return;
+        // Android peers use the pool DCs (sendOnChannel) just like desktop.
+        // Kotlin's NativeAssembler handles unordered arrival via RandomAccessFile.seek —
+        // each chunk is written at index*stride regardless of delivery order.
+        // sendDirect on a single DC was serialising crypto workers and causing
+        // SCTP buffer stalls; striping across 4 pool DCs with full SEND_CONCURRENCY
+        // keeps all crypto workers saturated and matches the desktop send path.
       }
 
       const dc = dcPool[chunk.index % dcPool.length];
       await this._rtc.sendOnChannel(dc, frame);
     };
 
-    // Lane count is tuned to the transport:
-    //   Desktop pool (4 DCs): 32 lanes — 8 per channel keeps every crypto worker
-    //   and each pool DC continuously saturated without unbounded memory.
-    //   Android single DC: 8 lanes — the bottleneck is one DC draining, not crypto
-    //   parallelism. More lanes just pile up in the write queue without benefit,
-    //   and risk unnecessary GC pressure from excess in-flight chunk buffers.
-    // IMPORTANT: await the outgoing slot BEFORE for-await pulls the next chunk
-    // from the generator. Both BYOB and slice() paths in Chunker.chunkFile()
-    // materialise a full ArrayBuffer per chunk before yielding, so without this
-    // await the loop pre-reads every chunk into memory (e.g. ~700 MB for a
-    // 1434-chunk file) long before any lane drains — causing GC pressure that
-    // stalls the DataChannel after the first handful of chunks.
-    // With the await, at most activeConcurrency + 1 chunk buffers exist at once.
-    const activeConcurrency = isAndroidPeer ? 8 : SEND_CONCURRENCY;
+    // Both Android and desktop use the full pool with SEND_CONCURRENCY lanes.
+    // Android's NativeAssembler handles unordered chunks natively; the crypto
+    // workers are the bottleneck, not the DC count — full concurrency keeps them
+    // saturated across all 4 pool DCs.
+    const activeConcurrency = SEND_CONCURRENCY;
     const lanes = new Array(activeConcurrency).fill(Promise.resolve());
     let lane = 0;
     let chunkCount = 0;

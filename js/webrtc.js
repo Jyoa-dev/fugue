@@ -44,6 +44,10 @@ const _isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
 // sender wakes up while there is still room in the pipe — no idle stall.
 const BUF_MIN = 32   * 1024;        //  32 KB floor — conservative for Android SCTP
 const BUF_MAX =  16  * 1024 * 1024; //   16 MB ceiling
+// Tighter ceiling for the single ordered android-direct DC. The pool adaptation
+// can reach 16 MB safely across 4 parallel streams; a single ordered channel
+// accumulates SCTP debt instead — cap at 512 KB (~2 chunks) to keep latency low.
+const BUF_MAX_ANDROID = 512 * 1024; // 512 KB ceiling for android-direct DC
 
 function initialBufHigh() {
   const c = navigator.connection || navigator.mozConnection;
@@ -144,11 +148,6 @@ export class WebRTCMesh extends EventTarget {
     if (this.myPeerId > peerId) {
       const dc = pc.createDataChannel('files', { ordered: false });
       this._setupDC(peerId, dc);
-      // Ordered DC for Android direct sends — avoids SCTP reordering stalls on
-      // large (256 KB) frames. The 'files' DC stays unordered for chat/signaling.
-      // Created before the offer so both channels are negotiated in one SDP round-trip.
-      const adc = pc.createDataChannel('android-direct', { ordered: true });
-      this._setupAndroidDC(peerId, adc);
       // Pre-open the transfer pool — all created before the offer so the
       // SDP carries all streams in one round-trip with no extra negotiation.
       this._openPool(peerId, pc);
@@ -358,13 +357,6 @@ export class WebRTCMesh extends EventTarget {
         if (buffered?.length) {
           this._icePending.delete(senderId);
           for (const c of buffered) { try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch {} }
-        }
-        // If the offer came from an Android peer, create the ordered direct-send
-        // DC before the answer so it's negotiated in this round-trip (no renegotiation).
-        // The initiator path does this in addPeer(); responder must mirror it here.
-        if (msg._android && !this._androidDcs.has(senderId)) {
-          const adc = pc.createDataChannel('android-direct', { ordered: true });
-          this._setupAndroidDC(senderId, adc);
         }
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
@@ -591,7 +583,8 @@ export class WebRTCMesh extends EventTarget {
   _setupAndroidDC(peerId, dc) {
     this._androidDcs.set(peerId, dc);
     dc.binaryType = 'arraybuffer';
-    dc._bufHigh   = initialBufHigh();
+    dc._bufHigh   = BUF_MIN;         // start low — adaptation grows from here
+    dc._bufMax    = BUF_MAX_ANDROID; // cap adaptation at 512 KB (single ordered DC)
     dc._peerId    = peerId;
     dc.onclose = () => { this._androidDcs.delete(peerId); };
     dc.onerror = e => {
@@ -764,10 +757,10 @@ export class WebRTCMesh extends EventTarget {
     console.debug(`[drain] exit ${dc.label} | ${Math.round(elapsed)} ms | ~${kbps} kbps | buffered=${(dc.bufferedAmount/1024).toFixed(0)}KB | concurrent=${d.concurrentDrains} | bufHigh=${((budget._bufHigh??BUF_MIN)/1024).toFixed(0)}KB`);
     // Write adaptation result back to shared budget so all pool channels on this
     // peer converge together rather than each channel tuning independently.
-    if (elapsed < 20 && budget._bufHigh < BUF_MAX) {
+    if (elapsed < 20 && budget._bufHigh < (budget._bufMax ?? BUF_MAX)) {
       // Fast drain → link has headroom, grow aggressively (×2) so we reach
-      // BUF_MAX in ~2 cycles from the 4 MB start rather than crawling up.
-      budget._bufHigh = Math.min(BUF_MAX, (budget._bufHigh * 2) | 0);
+      // the ceiling in ~2 cycles from the 4 MB start rather than crawling up.
+      budget._bufHigh = Math.min(budget._bufMax ?? BUF_MAX, (budget._bufHigh * 2) | 0);
     } else if (elapsed > 300 && budget._bufHigh > BUF_MIN) {
       // Very slow → shrink aggressively to converge quickly
       budget._bufHigh = Math.max(BUF_MIN, (budget._bufHigh * 0.5) | 0);
