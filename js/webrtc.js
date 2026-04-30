@@ -14,7 +14,7 @@ const ICE_SERVERS = [
 // App-level chunks larger than this are split into multiple DC frames by _sendOnDC
 // and re-merged transparently by _handleFrame before the binary event fires.
 // Small messages (chat etc.) still hit the total===1 fast-path with zero reassembly.
-const DC_CHUNK = 64 * 1024; // 64 KB — required for Safari compatibility
+const DC_CHUNK = 16 * 1024; // 16 KB — Android native SCTP receive window
 
 // ── Adaptive back-pressure ───────────────────────────────────────────────
 // Each DataChannel gets its own _bufHigh (send watermark) that tunes itself:
@@ -24,7 +24,7 @@ const DC_CHUNK = 64 * 1024; // 64 KB — required for Safari compatibility
 //
 // The RESUME threshold (bufferedAmountLowThreshold) is set to high/2 so the
 // sender wakes up while there is still room in the pipe — no idle stall.
-const BUF_MIN = 64   * 1024;        //  64 KB floor — conservative for Android native WebRTC SCTP
+const BUF_MIN = 32   * 1024;        //  32 KB floor — conservative for Android SCTP
 const BUF_MAX =  16  * 1024 * 1024; //   16 MB ceiling
 
 function initialBufHigh() {
@@ -71,7 +71,7 @@ export class WebRTCMesh extends EventTarget {
     this._xferPoolBuf     = new Map(); // peerId → DCs received but pool not yet full
     /** @type {Map<string, { bufHigh: number }>} */
     this._xferBufHigh     = new Map(); // peerId → shared back-pressure budget for pool DCs
-    /** @type {Set<string>} peers identified as Android native-WebRTC (via _android flag in rtc_answer) */
+    /** @type {Set<string>} peers identified as Android native-WebRTC (via _android flag in rtc_offer or rtc_answer) */
     this._androidPeers    = new Set();
     // Per-DC write queues — gives each pool channel an independent drain loop so
     // concurrent sendOnChannel calls on different DCs overlap instead of serialising.
@@ -173,6 +173,31 @@ export class WebRTCMesh extends EventTarget {
     await this._sendOnDC(dc, buffer);
   }
 
+  // Direct send for Android native peers — NO transport wrapper, NO splitting.
+  // Android's SCTP stack (libwebrtc) delivers complete messages via onMessage()
+  // transparently, so Kotlin parseDCFrame() receives the raw app frame directly.
+  // dc.send() max message size is 65535 bytes (Chrome/libwebrtc default); the
+  // caller (room.js) must cap frame size to ≤ 65535 bytes (64 KB app chunks
+  // + 26-byte header + 28-byte AES-GCM overhead = well within this limit).
+  // Uses the shared 'files' DC (same as sendBinary) — no pool needed for Android.
+  async sendDirect(peerId, buffer) {
+    const dc = this._dcs.get(peerId);
+    if (!dc || dc.readyState !== 'open') throw new Error(`No open DC to ${peerId}`);
+    const bytes = buffer instanceof ArrayBuffer ? buffer : buffer.buffer;
+    // Back-pressure: honour the same budget as sendBinary so we don't overrun
+    // the shared DC buffer on a slow link.
+    if (dc.bufferedAmount > (dc._bufHigh ?? BUF_MIN)) {
+      const stalled = await this._drainBuffer(dc);
+      if (stalled) {
+        console.warn('[sendDirect] aborting', peerId.slice(0, 8), '— stall during drain');
+        return false;
+      }
+    }
+    if (dc.readyState !== 'open') return false;
+    this._xferDiag.bytesSent += bytes.byteLength;
+    dc.send(bytes);
+  }
+
   // Send on a pool DC (from getPoolChannels).
   //
   // Each pool DC has its own independent drain loop (_runDCQueue). This Promise
@@ -234,6 +259,18 @@ export class WebRTCMesh extends EventTarget {
       let pc = this._pcs.get(senderId);
       if (!pc) pc = this._createPC(senderId);
       if (pc._native) return; // handed off to webrtc_android_bridge.js
+      // ── Android peer detection (offer path) ────────────────────────────
+      // webrtc_android_bridge.js stamps _android:true on offers it sends.
+      // The desktop is the responder here, so we learn about the Android peer
+      // from the offer — before we ever see an answer.
+      if (msg._android && !this._androidPeers.has(senderId)) {
+        this._androidPeers.add(senderId);
+        console.log(
+          '[mesh] 📱 peer', senderId.slice(0, 8),
+          '— Android detected via offer, native WebRTC path active (NativeRtcBridge.kt)',
+          '| total android peers:', this._androidPeers.size,
+        );
+      }
       if (pc.signalingState !== 'stable') return;
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
@@ -552,8 +589,6 @@ export class WebRTCMesh extends EventTarget {
         if (cur >= lastBuffered) {
           stalledTicks++;
           if (stalledTicks >= 60) { // 60 × 50 ms = 3000 ms with no progress
-            // Android native WebRTC SCTP ramps up slowly — tolerate longer stalls
-            // before giving up. 500 ms was too aggressive for native stack peers.
             console.warn('[drain] SCTP stall on', dc.label,
               '| buffered:', cur, 'B unchanged for 3000 ms — force-resolving');
             forceResolved = true;

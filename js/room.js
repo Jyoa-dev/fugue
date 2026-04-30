@@ -773,6 +773,20 @@ export class Room {
     // Pre-encode fileId bytes once (saves 16 parseInt calls per chunk).
     const fileIdBytes = uuidToBytes(fileId);
 
+    // ── Android chunk size cap ────────────────────────────────────────────
+    // For Android native peers we bypass _sendOnDC's transport wrapper entirely
+    // (sendDirect calls dc.send() once per app frame). Chrome/libwebrtc enforces
+    // a 65535-byte SCTP message limit by default, so each dc.send() call must be
+    // ≤ 65535 bytes. A 64 KB plaintext chunk + 26-byte header + 28-byte AES-GCM
+    // overhead = 65 582 bytes — just over the limit. Cap plaintext at 64 KB - 54
+    // (header + crypto) = 65 481 bytes to stay safely under the ceiling.
+    // Desktop-to-desktop transfers are unaffected: they use _sendOnDC which splits
+    // automatically and the receiver reassembles via _handleFrame.
+    const ANDROID_CHUNK_CAP = 64 * 1024 - 54; // 65 482 bytes
+    const effectiveChunkSize = isAndroidPeer
+      ? Math.min(entry.chunkSize, ANDROID_CHUNK_CAP)
+      : entry.chunkSize;
+
     // ── LAN fast-path (files ≥ 5 MB, Android only) ───────────────────────
     // Attempt TCP over Wi-Fi Direct or LAN before falling through to WebRTC DC.
     // On Android, the bridge's patched sendOnChannel/getPoolChannels already
@@ -786,10 +800,11 @@ export class Room {
     }
 
     // Android native path: bypass pool DC entirely.
-    // Kotlin owns the DataChannels directly — no JS transport envelope,
-    // no pool striping needed. sendBinary → AndroidRtc.sendShared → Kotlin
-    // sendBytes → splitFrame → dc.send. One call per app chunk.
-    const isAndroidPeer = this._rtc._pcs.get(requesterId)?._native === true;
+    // Kotlin owns the DataChannels directly — sendBinary → AndroidRtc.sendShared
+    // → Kotlin sendBytes → splitFrame → dc.send. One call per app chunk.
+    // _androidPeers is populated by webrtc.js when it receives _android:true
+    // in the rtc_answer, covering both initiator and responder cases.
+    const isAndroidPeer = this._rtc._androidPeers?.has(requesterId) === true;
 
     const sendOne = async (chunk) => {
       if (this._cancelled.has(fileId)) return;
@@ -809,8 +824,9 @@ export class Room {
       }
 
       if (isAndroidPeer) {
-        // Direct shared DC send — Kotlin handles SCTP fragmentation natively.
-        await this._rtc.sendBinary(requesterId, frame);
+        // sendDirect: raw dc.send() with no _sendOnDC transport wrapper.
+        // Kotlin's parseDCFrame() sees the app frame bytes starting at offset 0.
+        await this._rtc.sendDirect(requesterId, frame);
         return;
       }
 
@@ -830,7 +846,7 @@ export class Room {
     const lanes = new Array(SEND_CONCURRENCY).fill(Promise.resolve());
     let lane = 0;
     let chunkCount = 0;
-    for await (const chunk of Chunker.chunkFile(entry.file, entry.chunkSize, startChunk)) {
+    for await (const chunk of Chunker.chunkFile(entry.file, effectiveChunkSize, startChunk)) {
       if (this._cancelled.has(fileId)) break;
       const l = lane++ % SEND_CONCURRENCY;
       await lanes[l];                          // free the slot first — this is what
