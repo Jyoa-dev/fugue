@@ -8,19 +8,27 @@ const ICE_SERVERS = [
   { urls: 'stun:stun.relay.metered.ca:80'   },
 ];
 
-// Maximum bytes per dc.send() call — 3-tier by peer type:
+// Maximum payload bytes per _sendOnDC fragment — 3-tier by peer type.
+// _sendOnDC prepends a 12-byte transport header (transferId + total + index)
+// to every dc.send() call, so the raw dc.send() size is always (12 + chunk).
+// Each constant must therefore be (browser ceiling − 12) so the wire frame
+// never exceeds the hard ceiling that throws a DOMException.
 //
-//   Android peers   → 16 KB  (libwebrtc SCTP receive window on native Android stack)
-//   Safari peers    → 64 KB  (WebKit hard cap; exceeding throws DOMException)
-//   Chrome/Firefox  → 256 KB (libwebrtc kMaxSctpMessageSize; browser enforces
-//                             this as a hard ceiling — sending > 256 KB throws)
+//   Android peers   → 16 KB  (libwebrtc SCTP receive window on native Android
+//                             stack; Android uses sendDirect which bypasses
+//                             _sendOnDC entirely, so the header offset does not
+//                             apply — value kept for _chunkSizeFor reference)
+//   Safari peers    → 64 KB  (WebKit hard cap is exactly 65536 B;
+//                             65536 − 12 = 65524 B payload ceiling)
+//   Chrome/Firefox  → 256 KB (libwebrtc kMaxSctpMessageSize = 262144 B;
+//                             262144 − 12 = 262132 B payload ceiling)
 //
-// _sendOnDC reads chunkSizeFor(peerId) at call time so the right size is used
+// _sendOnDC reads _chunkSizeFor(peerId) at call time so the right size is used
 // per-peer. Small messages (chat etc.) still hit the total===1 fast-path with
 // zero reassembly overhead regardless of which tier is active.
-const DC_CHUNK_ANDROID = 16  * 1024;  // 16 KB
-const DC_CHUNK_SAFARI  = 64  * 1024;  // 64 KB
-const DC_CHUNK_DESKTOP = 256 * 1024;  // 256 KB
+const DC_CHUNK_ANDROID = 16  * 1024;          // 16 KB  (sendDirect path — header not added)
+const DC_CHUNK_SAFARI  = 64  * 1024 - 12;     // 65524 B — keeps dc.send() ≤ 65536 B
+const DC_CHUNK_DESKTOP = 256 * 1024 - 12;     // 262132 B — keeps dc.send() ≤ 262144 B
 
 // Detect Safari once at module load — User-Agent sniff is reliable enough here
 // because the chunk size only needs to match what THIS browser's dc.send() allows.
@@ -41,11 +49,10 @@ function initialBufHigh() {
   const c = navigator.connection || navigator.mozConnection;
   if (c) {
     // wifi/downlink detection reflects the LOCAL nic, not the peer's link.
-    // Stay conservative so the adaptive can grow rather than stall on first drain.
-    if (c.downlink > 10 || c.type === 'wifi')     return 1 * 1024 * 1024; // 1 MB  (was 4 MB)
+    if (c.downlink > 10 || c.type === 'wifi')     return 4 * 1024 * 1024; // 4 MB
     if (c.downlink <  2 || c.type === 'cellular') return BUF_MIN;
   }
-  return 256 * 1024; // 256 KB default — ramps up quickly if link is fast
+  return 4 * 1024 * 1024; // 4 MB default — adaptive shrinks if link is slow
 }
 
 // ── Transfer pool ────────────────────────────────────────────────────────
@@ -79,7 +86,7 @@ export class WebRTCMesh extends EventTarget {
     this._xferPoolResolve = new Map(); // peerId → pending getPoolChannels resolver
     /** @type {Map<string, RTCDataChannel[]>} */
     this._xferPoolBuf     = new Map(); // peerId → DCs received but pool not yet full
-    /** @type {Map<string, { bufHigh: number }>} */
+    /** @type {Map<string, { _bufHigh: number }>} */
     this._xferBufHigh     = new Map(); // peerId → shared back-pressure budget for pool DCs
     /** @type {Set<string>} peers identified as Android native-WebRTC (via _android flag in rtc_offer or rtc_answer) */
     this._androidPeers    = new Set();
@@ -348,7 +355,7 @@ export class WebRTCMesh extends EventTarget {
       if (msg._android && !this._androidPeers.has(senderId)) {
         this._androidPeers.add(senderId);
         console.log(
-          '[mesh] \uD83D\uDCF1 peer', senderId.slice(0, 8),
+          '[mesh] 📱 peer', senderId.slice(0, 8),
           '— Android detected, native WebRTC path active (NativeRtcBridge.kt)',
           '| total android peers:', this._androidPeers.size,
         );
@@ -392,7 +399,11 @@ export class WebRTCMesh extends EventTarget {
 
     // Shared budget — all pool DCs on this peer adapt together instead of
     // each channel independently tuning its own threshold.
-    const shared = { bufHigh: initialBufHigh() };
+    // FIX: key must be _bufHigh (not bufHigh) — _sendOnDC and _drainBuffer both
+    // read (dc._sharedBufHigh ?? dc)._bufHigh, so a mismatched key silently
+    // returned undefined and fell back to BUF_MIN (32 KB) for every pool send,
+    // causing immediate back-pressure stalls and transfer_cancel on desktop peers.
+    const shared = { _bufHigh: initialBufHigh() };
     this._xferBufHigh.set(peerId, shared);
 
     const onOpen = () => {
@@ -470,7 +481,8 @@ export class WebRTCMesh extends EventTarget {
             this._xferPool.set(peerId, pool);
 
             // Shared budget for responder pool — same as initiator side.
-            const shared = { bufHigh: initialBufHigh() };
+            // FIX: key must be _bufHigh — see matching fix in _openPool above.
+            const shared = { _bufHigh: initialBufHigh() };
             this._xferBufHigh.set(peerId, shared);
             pool.forEach(dc => { dc._sharedBufHigh = shared; dc._peerId = peerId; });
 
@@ -690,8 +702,9 @@ export class WebRTCMesh extends EventTarget {
     // Write adaptation result back to shared budget so all pool channels on this
     // peer converge together rather than each channel tuning independently.
     if (elapsed < 20 && budget._bufHigh < BUF_MAX) {
-      // Fast drain → link has headroom, grow conservatively (×1.25 was ×1.5)
-      budget._bufHigh = Math.min(BUF_MAX, (budget._bufHigh * 1.25) | 0);
+      // Fast drain → link has headroom, grow aggressively (×2) so we reach
+      // BUF_MAX in ~2 cycles from the 4 MB start rather than crawling up.
+      budget._bufHigh = Math.min(BUF_MAX, (budget._bufHigh * 2) | 0);
     } else if (elapsed > 300 && budget._bufHigh > BUF_MIN) {
       // Very slow → shrink aggressively to converge quickly
       budget._bufHigh = Math.max(BUF_MIN, (budget._bufHigh * 0.5) | 0);
