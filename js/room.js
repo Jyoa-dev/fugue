@@ -197,10 +197,15 @@ class StreamingDownloader {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-// Concurrent encrypt+send lanes. 16 keeps the crypto pool and DC buffer
-// continuously saturated. Each lane maps to one worker in the 4-worker pool
-// (4 lanes share a worker), so we always have work queued in every worker.
-const SEND_CONCURRENCY = 16;
+// Concurrent encrypt+send lanes.
+// Desktop → desktop: 32 lanes across the 4-worker pool (8 lanes/worker) keeps
+// every crypto worker and the pool DCs continuously saturated.
+// Desktop → Android: sendDirect bypasses the pool (single shared DC, one
+// dc.send() per app frame). The original value of 16 was tuned for 4-lane pool
+// usage; with 64 KB chunks going over a single DC, raising to 32 lets more
+// crypto work overlap with DC drain time without measurably growing heap.
+// Cap: monitor Android heap with Android Studio — back off if GC pauses appear.
+const SEND_CONCURRENCY = 32;
 
 // Files we can show inline — use Blob URL path so preview works.
 // Everything else streams via SW (zero heap for large files).
@@ -803,6 +808,20 @@ export class Room {
       ? Math.min(entry.chunkSize, ANDROID_CHUNK_CAP)
       : entry.chunkSize;
 
+    // Seed the shared DC's send budget at the floor when targeting an Android peer.
+    // initialBufHigh() reflects the desktop's own link (wifi → 1 MB, default 256 KB)
+    // but Android receives on a slower SCTP stack. Starting high means the adaptive
+    // loop must shrink through several painful drain cycles before converging.
+    // Starting at BUF_MIN (32 KB) lets it grow upward from the first fast drain —
+    // one small stall on chunk 1 instead of multiple large stalls early in the file.
+    if (isAndroidPeer) {
+      const dc = this._rtc._dcs?.get(requesterId);
+      if (dc && dc._bufHigh > 32 * 1024) {
+        dc._bufHigh = 32 * 1024; // BUF_MIN — will grow via _drainBuffer adaptation
+        console.log('[sendChunks] Android peer — seeding dc._bufHigh at BUF_MIN for', requesterId.slice(0, 8));
+      }
+    }
+
     // ── LAN fast-path (files ≥ 5 MB, Android only) ───────────────────────
     // Attempt TCP over Wi-Fi Direct or LAN before falling through to WebRTC DC.
     // On Android, the bridge's patched sendOnChannel/getPoolChannels already
@@ -822,7 +841,17 @@ export class Room {
       const frame = encodeDCChunk(fileIdBytes, chunk.index, chunk.total, !!this._crypto, chunkBuf);
 
       if (useLan) {
-        const b64 = btoa(String.fromCharCode(...new Uint8Array(frame)));
+        // btoa(String.fromCharCode(...new Uint8Array(frame))) spreads the entire
+        // buffer into a temporary string before encoding — O(n) allocation on every
+        // chunk. At LAN speeds (where this path is taken) that becomes the CPU
+        // ceiling. Process in 8 KB slices instead: each slice fits in L1/L2 cache
+        // and the string is discarded immediately after btoa encodes it.
+        const bytes = new Uint8Array(frame instanceof ArrayBuffer ? frame : frame.buffer);
+        let b64 = '';
+        const SLICE = 8192;
+        for (let i = 0; i < bytes.length; i += SLICE) {
+          b64 += btoa(String.fromCharCode(...bytes.subarray(i, i + SLICE)));
+        }
         const ok  = window.AndroidRtc.sendLanChunk(requesterId, b64);
         if (!ok) {
           console.warn('[lan] sendLanChunk failed at chunk', chunk.index, '— falling back to WebRTC');
@@ -843,21 +872,26 @@ export class Room {
       await this._rtc.sendOnChannel(dc, frame);
     };
 
-    // 16 concurrent lanes: round-robin assignment keeps every crypto worker
-    // and the DC send buffer continuously saturated without unbounded memory.
+    // Lane count is tuned to the transport:
+    //   Desktop pool (4 DCs): 32 lanes — 8 per channel keeps every crypto worker
+    //   and each pool DC continuously saturated without unbounded memory.
+    //   Android single DC: 8 lanes — the bottleneck is one DC draining, not crypto
+    //   parallelism. More lanes just pile up in the write queue without benefit,
+    //   and risk unnecessary GC pressure from excess in-flight chunk buffers.
     // IMPORTANT: await the outgoing slot BEFORE for-await pulls the next chunk
     // from the generator. Both BYOB and slice() paths in Chunker.chunkFile()
     // materialise a full ArrayBuffer per chunk before yielding, so without this
     // await the loop pre-reads every chunk into memory (e.g. ~700 MB for a
     // 1434-chunk file) long before any lane drains — causing GC pressure that
     // stalls the DataChannel after the first handful of chunks.
-    // With the await, at most SEND_CONCURRENCY + 1 chunk buffers exist at once.
-    const lanes = new Array(SEND_CONCURRENCY).fill(Promise.resolve());
+    // With the await, at most activeConcurrency + 1 chunk buffers exist at once.
+    const activeConcurrency = isAndroidPeer ? 8 : SEND_CONCURRENCY;
+    const lanes = new Array(activeConcurrency).fill(Promise.resolve());
     let lane = 0;
     let chunkCount = 0;
     for await (const chunk of Chunker.chunkFile(entry.file, effectiveChunkSize, startChunk)) {
       if (this._cancelled.has(fileId)) break;
-      const l = lane++ % SEND_CONCURRENCY;
+      const l = lane++ % activeConcurrency;
       await lanes[l];                          // free the slot first — this is what
       if (this._cancelled.has(fileId)) break;  // gates the generator's next read
       if (chunkCount === 0) console.log('[sendChunks] first chunk, total:', chunk.total);

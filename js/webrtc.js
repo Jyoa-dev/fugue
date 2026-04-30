@@ -8,13 +8,23 @@ const ICE_SERVERS = [
   { urls: 'stun:stun.relay.metered.ca:80'   },
 ];
 
-// Maximum bytes per dc.send() call.
-// 64 KB is the safe floor across all browsers — Safari enforces a hard SCTP
-// message limit around 64 KB regardless of what Chrome/Firefox allow.
-// App-level chunks larger than this are split into multiple DC frames by _sendOnDC
-// and re-merged transparently by _handleFrame before the binary event fires.
-// Small messages (chat etc.) still hit the total===1 fast-path with zero reassembly.
-const DC_CHUNK = 16 * 1024; // 16 KB — Android native SCTP receive window
+// Maximum bytes per dc.send() call — 3-tier by peer type:
+//
+//   Android peers   → 16 KB  (libwebrtc SCTP receive window on native Android stack)
+//   Safari peers    → 64 KB  (WebKit hard cap; exceeding throws DOMException)
+//   Chrome/Firefox  → 256 KB (libwebrtc kMaxSctpMessageSize; browser enforces
+//                             this as a hard ceiling — sending > 256 KB throws)
+//
+// _sendOnDC reads chunkSizeFor(peerId) at call time so the right size is used
+// per-peer. Small messages (chat etc.) still hit the total===1 fast-path with
+// zero reassembly overhead regardless of which tier is active.
+const DC_CHUNK_ANDROID = 16  * 1024;  // 16 KB
+const DC_CHUNK_SAFARI  = 64  * 1024;  // 64 KB
+const DC_CHUNK_DESKTOP = 256 * 1024;  // 256 KB
+
+// Detect Safari once at module load — User-Agent sniff is reliable enough here
+// because the chunk size only needs to match what THIS browser's dc.send() allows.
+const _isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
 
 // ── Adaptive back-pressure ───────────────────────────────────────────────
 // Each DataChannel gets its own _bufHigh (send watermark) that tunes itself:
@@ -180,22 +190,61 @@ export class WebRTCMesh extends EventTarget {
   // caller (room.js) must cap frame size to ≤ 65535 bytes (64 KB app chunks
   // + 26-byte header + 28-byte AES-GCM overhead = well within this limit).
   // Uses the shared 'files' DC (same as sendBinary) — no pool needed for Android.
-  async sendDirect(peerId, buffer) {
+  //
+  // Queued: resolves the moment the buffer is dequeued, not when it drains.
+  // This lets room.js lanes race ahead on crypto work while the single shared DC
+  // drains — same contract as sendOnChannel. Without this, all 32 lanes block
+  // simultaneously in _drainBuffer on a slow link, serialising the crypto pool.
+  sendDirect(peerId, buffer) {
     const dc = this._dcs.get(peerId);
     if (!dc || dc.readyState !== 'open') throw new Error(`No open DC to ${peerId}`);
     const bytes = buffer instanceof ArrayBuffer ? buffer : buffer.buffer;
-    // Back-pressure: honour the same budget as sendBinary so we don't overrun
-    // the shared DC buffer on a slow link.
-    if (dc.bufferedAmount > (dc._bufHigh ?? BUF_MIN)) {
-      const stalled = await this._drainBuffer(dc);
-      if (stalled) {
-        console.warn('[sendDirect] aborting', peerId.slice(0, 8), '— stall during drain');
-        return false;
+    const d = this._xferDiag;
+    d.calls++;
+    const enqueueAt = performance.now();
+    let q = this._writeQueues.get(dc);
+    if (!q) { q = { pending: [], running: false }; this._writeQueues.set(dc, q); }
+    return new Promise(resolve => {
+      q.pending.push({ buffer: bytes, resolve: () => {
+        d.queueWaitMs += performance.now() - enqueueAt;
+        resolve();
+      }});
+      if (!q.running) this._runDirectQueue(dc, q);
+    });
+  }
+
+  // Serial drain loop for the shared DC (Android path).
+  // Differs from _runDCQueue in that it calls dc.send() directly — no fragmentation
+  // wrapper — since Android expects intact app frames (parseDCFrame offset 0).
+  // Backpressure check + drain happen here, invisible to room.js callers.
+  async _runDirectQueue(dc, q) {
+    q.running = true;
+    while (q.pending.length > 0) {
+      if (dc.readyState !== 'open') {
+        console.warn('[directQueue] DC closed with', q.pending.length, 'items pending — flushing');
+        while (q.pending.length > 0) q.pending.shift().resolve();
+        break;
       }
+      const { buffer, resolve } = q.pending.shift();
+      resolve();                          // unblock caller — lane can now encrypt next chunk
+      if (dc.bufferedAmount > (dc._bufHigh ?? BUF_MIN)) {
+        const stalled = await this._drainBuffer(dc);
+        if (stalled) {
+          console.warn('[directQueue] aborting — stall during drain, buffered =',
+            (dc.bufferedAmount / 1024).toFixed(0), 'KB');
+          // Flush remaining so callers don't hang, then let peer_failed propagate.
+          while (q.pending.length > 0) q.pending.shift().resolve();
+          break;
+        }
+      }
+      if (dc.readyState !== 'open') {
+        while (q.pending.length > 0) q.pending.shift().resolve();
+        break;
+      }
+      this._xferDiag.bytesSent += buffer.byteLength;
+      dc.send(buffer);
     }
-    if (dc.readyState !== 'open') return false;
-    this._xferDiag.bytesSent += bytes.byteLength;
-    dc.send(bytes);
+    q.running = false;
   }
 
   // Send on a pool DC (from getPoolChannels).
@@ -356,6 +405,7 @@ export class WebRTCMesh extends EventTarget {
     for (let i = 0; i < XFER_POOL_SIZE; i++) {
       const dc = pc.createDataChannel(`xferp-${i}`, { ordered: false }); // ordered:false — no SCTP HOL blocking
       dc.binaryType     = 'arraybuffer';
+      dc._peerId        = peerId;
       dc._sharedBufHigh = shared; // point at shared object, not a per-DC value
       dc.onopen     = onOpen;
       dc.onmessage  = ({ data }) => this._handleFrame(peerId, data);
@@ -407,6 +457,7 @@ export class WebRTCMesh extends EventTarget {
         // Responder side of a pool DC. Collect until the full pool is open,
         // then resolve any waiting getPoolChannels() call.
         channel.binaryType = 'arraybuffer';
+        channel._peerId    = peerId;
         channel.onmessage  = ({ data }) => this._handleFrame(peerId, data);
         channel.onerror    = e => console.warn('pool DC error', peerId, channel.label, e);
         if (!this._xferPoolBuf.has(peerId)) this._xferPoolBuf.set(peerId, []);
@@ -421,7 +472,7 @@ export class WebRTCMesh extends EventTarget {
             // Shared budget for responder pool — same as initiator side.
             const shared = { bufHigh: initialBufHigh() };
             this._xferBufHigh.set(peerId, shared);
-            pool.forEach(dc => { dc._sharedBufHigh = shared; });
+            pool.forEach(dc => { dc._sharedBufHigh = shared; dc._peerId = peerId; });
 
             console.log('[pool] responder pool ready for', peerId.slice(0,8));
             this._xferPoolResolve.get(peerId)?.(pool);
@@ -462,6 +513,7 @@ export class WebRTCMesh extends EventTarget {
     this._dcs.set(peerId, dc);
     dc.binaryType = 'arraybuffer';
     dc._bufHigh   = initialBufHigh();
+    dc._peerId    = peerId;
 
     dc.onopen = () => {
       const q = this._dcReady.get(peerId) || [];
@@ -506,14 +558,24 @@ export class WebRTCMesh extends EventTarget {
     }
   }
 
+  // Returns the per-call dc.send() ceiling for the given peer:
+  //   Android → 16 KB, Safari (local browser) → 64 KB, desktop → 256 KB.
+  // dc._peerId is stamped in _setupDC and _openPool so every DC carries its peer.
+  _chunkSizeFor(peerId) {
+    if (peerId && this._androidPeers.has(peerId)) return DC_CHUNK_ANDROID;
+    if (_isSafari)                                return DC_CHUNK_SAFARI;
+    return DC_CHUNK_DESKTOP;
+  }
+
   async _sendOnDC(dc, buffer) {
     const bytes      = buffer instanceof ArrayBuffer ? buffer : buffer.buffer;
-    const total      = Math.ceil(bytes.byteLength / DC_CHUNK) || 1;
+    const chunk      = this._chunkSizeFor(dc._peerId);
+    const total      = Math.ceil(bytes.byteLength / chunk) || 1;
     const transferId = (Math.random() * 0xFFFFFFFF) >>> 0;
 
     for (let i = 0; i < total; i++) {
-      const offset     = i * DC_CHUNK;
-      const chunkBytes = Math.min(DC_CHUNK, bytes.byteLength - offset);
+      const offset     = i * chunk;
+      const chunkBytes = Math.min(chunk, bytes.byteLength - offset);
       const frame      = new ArrayBuffer(12 + chunkBytes);
       const view       = new DataView(frame);
       view.setUint32(0, transferId, true);
@@ -561,7 +623,12 @@ export class WebRTCMesh extends EventTarget {
     console.debug(drainingLabel);
     // Resume at high/2 so the sender wakes while there is still headroom —
     // avoids the "fill to high, idle until high" pattern that causes long stalls.
-    const resume = Math.max(DC_CHUNK, (high / 2) | 0);
+    // Floor: the DC's own per-call chunk size (16 KB Android, 256 KB desktop).
+    // Previously used Math.max(DC_CHUNK_DESKTOP, high/2) which is wrong: when
+    // budget shrinks to BUF_MIN (32 KB), high/2 = 16 KB but Math.max clamps to
+    // 256 KB — above the budget — so bufferedamountlow never fires until empty.
+    const dcChunk = this._chunkSizeFor(dc._peerId);
+    const resume = Math.max(dcChunk, Math.min(DC_CHUNK_DESKTOP, (high / 2) | 0));
     let forceResolved = false;
     await new Promise(r => {
       let done = false;

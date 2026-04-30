@@ -3,10 +3,29 @@
 //
 // Architecture:
 //  • Signaling (offer/answer/ICE) flows JS ↔ Kotlin via @JavascriptInterface
-//  • Outbound file chunks: JS encodes to base64, calls AndroidRtc.sendShared/sendPool
+//  • Outbound file chunks (FAST PATH): JS calls NativeBlob.sendChunk() / NativeFile.sendChunk()
+//    → single @JavascriptInterface call AndroidRtc.readAndSendChunk().
+//    Kotlin reads the chunk, encrypts with the session AES-GCM key, builds the
+//    26-byte DC frame header, and calls dc.send() — no base64, one bridge crossing.
+//    sendPool/sendShared are still used for non-file frames (signalling wrappers, etc.).
+//  • Outbound file chunks (LEGACY / non-Android fallback): sendOnChannel() still exists
+//    for desktop code paths and any caller that cannot use sendChunk().
 //  • Inbound file chunks: Kotlin receives DC frames, reassembles, decrypts, saves
-//    to MediaStore — JS never touches binary data on the receive path
+//    to MediaStore — JS never touches binary data on the receive path.
 //  • JS-only responsibility: UI callbacks (_nativeProgress, _nativeFileDone, etc.)
+//
+// readAndSendChunk @JavascriptInterface contract (Kotlin must implement):
+//   fun readAndSendChunk(
+//     token:        String,   // NativeFile._token opaque handle
+//     offset:       Long,     // byte offset into file
+//     length:       Int,      // bytes to read
+//     peerId:       String,   // destination peer UUID
+//     poolIndex:    Int,      // which pool DC to use (0–3)
+//     fileIdHex:    String,   // 8-char hex file-ID for the DC frame header
+//     chunkIndex:   Int,      // 0-based chunk sequence number
+//     totalChunks:  Int,      // total chunks for this transfer
+//     encryptedFlag:Boolean   // true → encrypt with session key before send
+//   ): Boolean               // false → caller should treat as send failure
 //
 // Kotlin → JS callbacks (all small strings, no binary):
 //  _nativeRtcOffer(peerId, sdpJson)
@@ -164,11 +183,9 @@ export function initAndroidBridge(WebRTCMesh) {
     const pc = this._pcs.get(peerId);
     if (!pc?._native) return _origSendBinary.call(this, peerId, buffer);
     _dbg('sendBinary (native shared DC)', peerId.slice(0,8));
-    const frames = _splitToFrames(buffer);
-    for (const frame of frames) {
-      const ok = window.AndroidRtc.sendShared(peerId, _toB64(frame));
-      if (!ok) throw new Error(`[android-bridge] sendShared failed for ${peerId.slice(0,8)}`);
-    }
+    const bytes = buffer instanceof ArrayBuffer ? buffer : buffer.buffer;
+    const ok = window.AndroidRtc.sendShared(peerId, _toB64(bytes));
+    if (!ok) throw new Error(`[android-bridge] sendShared failed for ${peerId.slice(0,8)}`);
   };
 
   // ── getPoolChannels ───────────────────────────────────────────────────────
@@ -200,6 +217,10 @@ export function initAndroidBridge(WebRTCMesh) {
   };
 
   // ── sendOnChannel — native pool DC ───────────────────────────────────────
+  // Used for non-file frames (small control messages, relay receipts, etc.) that
+  // are already fully assembled in JS.  File chunk senders should use
+  // NativeBlob.sendChunk() / NativeFile.sendChunk() instead — those avoid the
+  // double base64 round-trip by calling AndroidRtc.readAndSendChunk() directly.
   // JS → Kotlin: encode frame as base64, call @JavascriptInterface sendPool.
   const _origSendOnChannel = proto.sendOnChannel;
   proto.sendOnChannel = function(dc, buffer) {
@@ -207,8 +228,8 @@ export function initAndroidBridge(WebRTCMesh) {
     const { peerId, index } = dc._nativePool;
     _dbg('sendOnChannel (native pool)', peerId.slice(0,8), '| channel index:', index);
     return Promise.resolve().then(() => {
-      const frames = _splitToFrames(buffer);
-      for (const frame of frames) window.AndroidRtc.sendPool(peerId, index, _toB64(frame));
+      const bytes = buffer instanceof ArrayBuffer ? buffer : buffer.buffer;
+      window.AndroidRtc.sendPool(peerId, index, _toB64(bytes));
     });
   };
 
@@ -303,6 +324,15 @@ export function initAndroidBridge(WebRTCMesh) {
       return new NativeBlob(this._token, start, end - start, this.type);
     }
     release() { window.AndroidRtc.releaseFileToken(this._token); }
+
+    /**
+     * Fast-path outbound send for file chunks.
+     * Delegates to NativeBlob.sendChunk() — see that method for full docs.
+     */
+    sendChunk(offset, length, peerId, poolIndex, fileIdHex, chunkIndex, totalChunks, encryptedFlag = true) {
+      return this.slice(offset, offset + length)
+                 .sendChunk(peerId, poolIndex, fileIdHex, chunkIndex, totalChunks, encryptedFlag);
+    }
   }
 
   class NativeBlob {
@@ -311,6 +341,46 @@ export function initAndroidBridge(WebRTCMesh) {
       this._length = length; this.size = length; this.type = type;
     }
     async arrayBuffer() { return _readNativeRange(this._token, this._offset, this._length); }
+
+    /**
+     * Fast-path outbound send — eliminates the double base64 round-trip.
+     *
+     * Instead of:
+     *   readFileChunk() → base64 → _fromB64() → encrypt → _toB64() → sendPool() → Kotlin decode
+     * this issues a single @JavascriptInterface call and lets Kotlin handle everything:
+     *   read chunk → encrypt (AES-GCM, session key) → build 26-byte DC header → dc.send()
+     *
+     * @param {string}  peerId        - destination peer UUID
+     * @param {number}  poolIndex     - pool DC index (0–3)
+     * @param {string}  fileIdHex     - 8-char hex file-ID embedded in the DC frame header
+     * @param {number}  chunkIndex    - 0-based chunk sequence number
+     * @param {number}  totalChunks   - total chunks for this transfer
+     * @param {boolean} [encryptedFlag=true] - pass false only for unencrypted debug transfers
+     * @returns {boolean} false if Kotlin reports a send failure (caller should abort transfer)
+     *
+     * Requires AndroidRtc.readAndSendChunk() @JavascriptInterface (see contract in file header).
+     * Falls back silently to false (not an exception) if the method is absent so callers can
+     * detect an outdated Kotlin build and degrade to the legacy arrayBuffer() path.
+     */
+    sendChunk(peerId, poolIndex, fileIdHex, chunkIndex, totalChunks, encryptedFlag = true) {
+      if (typeof window.AndroidRtc.readAndSendChunk !== 'function') {
+        _warn('sendChunk — AndroidRtc.readAndSendChunk not available; Kotlin build may be outdated');
+        return false;
+      }
+      _dbg('sendChunk (native fast-path)', peerId.slice(0, 8),
+           '| pool:', poolIndex, '| chunk:', chunkIndex, '/', totalChunks);
+      return window.AndroidRtc.readAndSendChunk(
+        this._token,
+        this._offset,
+        this._length,
+        peerId,
+        poolIndex,
+        fileIdHex,
+        chunkIndex,
+        totalChunks,
+        encryptedFlag,
+      );
+    }
   }
 
   async function _readNativeRange(token, offset, length) {
@@ -321,27 +391,7 @@ export function initAndroidBridge(WebRTCMesh) {
   }
 
   // ── Frame helpers (outbound only) ─────────────────────────────────────────
-
-  const DC_CHUNK = 64 * 1024;
-
-  function _splitToFrames(buffer) {
-    const bytes      = buffer instanceof ArrayBuffer ? buffer : buffer.buffer;
-    const total      = Math.ceil(bytes.byteLength / DC_CHUNK) || 1;
-    const transferId = (Math.random() * 0xFFFFFFFF) >>> 0;
-    const frames     = [];
-    for (let i = 0; i < total; i++) {
-      const offset     = i * DC_CHUNK;
-      const chunkBytes = Math.min(DC_CHUNK, bytes.byteLength - offset);
-      const frame      = new ArrayBuffer(12 + chunkBytes);
-      const view       = new DataView(frame);
-      view.setUint32(0, transferId, true);
-      view.setUint32(4, total,      true);
-      view.setUint32(8, i,          true);
-      new Uint8Array(frame, 12).set(new Uint8Array(bytes, offset, chunkBytes));
-      frames.push(frame);
-    }
-    return frames;
-  }
+  // No fragmentation here — Kotlin's sendBytes() calls splitFrame() natively.
 
   function _toB64(arrayBuffer) {
     const bytes = new Uint8Array(arrayBuffer);

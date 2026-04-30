@@ -26,11 +26,12 @@ export const Chunker = (() => {
           // is full or the stream signals EOF, then yield exactly one chunk.
           const chunkBytes = Math.min(chunkSize, remaining);
           const staging    = new Uint8Array(chunkBytes);
+          const readBuf    = new Uint8Array(new ArrayBuffer(chunkBytes));
           let filled = 0;
           let eof    = false;
           while (filled < chunkBytes) {
             const { value, done } = await reader.read(
-              new Uint8Array(new ArrayBuffer(chunkBytes - filled))
+              new Uint8Array(readBuf.buffer, filled, chunkBytes - filled)
             );
             if (done || !value?.byteLength) { eof = true; break; }
             staging.set(value, filled);
