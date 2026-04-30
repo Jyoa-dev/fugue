@@ -773,6 +773,10 @@ export class Room {
     // Pre-encode fileId bytes once (saves 16 parseInt calls per chunk).
     const fileIdBytes = uuidToBytes(fileId);
 
+    // _androidPeers is populated by webrtc.js when it receives _android:true
+    // in the rtc_offer (responder path) or rtc_answer (initiator path).
+    const isAndroidPeer = this._rtc._androidPeers?.has(requesterId) === true;
+
     // ── Android chunk size cap ────────────────────────────────────────────
     // For Android native peers we bypass _sendOnDC's transport wrapper entirely
     // (sendDirect calls dc.send() once per app frame). Chrome/libwebrtc enforces
@@ -798,13 +802,6 @@ export class Room {
       useLan = await this._waitForLanReady(requesterId, 10_000);
       console.log('[lan] useLan =', useLan);
     }
-
-    // Android native path: bypass pool DC entirely.
-    // Kotlin owns the DataChannels directly — sendBinary → AndroidRtc.sendShared
-    // → Kotlin sendBytes → splitFrame → dc.send. One call per app chunk.
-    // _androidPeers is populated by webrtc.js when it receives _android:true
-    // in the rtc_answer, covering both initiator and responder cases.
-    const isAndroidPeer = this._rtc._androidPeers?.has(requesterId) === true;
 
     const sendOne = async (chunk) => {
       if (this._cancelled.has(fileId)) return;
