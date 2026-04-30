@@ -390,6 +390,35 @@ export class Room {
       const identity = this.peers.get(peerId)?.identity || peerId.slice(0, 8);
       this.onMessage?.({ type: 'system', text: `${identity}: ${TURN_WARNING}`, subtype: 'warning' });
     });
+
+    // ── Kotlin → JS callbacks for native receive path ─────────────────────
+    // Kotlin reassembles, decrypts, and saves inbound files entirely natively.
+    // These callbacks are the only JS involvement on the receive side.
+    if (typeof window.AndroidRtc !== 'undefined') {
+      window._nativeProgress = (fileId, ratio) => {
+        this.fileStore.updateProgress(fileId, ratio);
+        this.onFileUpdate?.();
+      };
+
+      window._nativeFileDone = (fileId, name, mime) => {
+        this.fileStore.setStatus(fileId, 'done');
+        this.fileStore.updateProgress(fileId, 1);
+        this.onFileUpdate?.();
+        this.onMessage?.({ type: 'system', text: `${name} saved to Downloads`, subtype: 'receipt' });
+      };
+
+      window._nativeFileError = (fileId, name, msg) => {
+        console.error('[native-save] error', name, msg);
+        this.fileStore.setStatus(fileId, 'error');
+        this.onFileUpdate?.();
+        this.onMessage?.({ type: 'system', text: `Failed to save ${name}: ${msg}`, subtype: 'warning' });
+      };
+
+      window._nativeRelayReceipt = (fileId, peerId) => {
+        this.relay.send({ type: 'receipt', fileId, receiptType: 'downloaded', senderId: this.myPeerId, senderName: this.identity });
+        if (this._crypto) this.relay.send({ type: 'receipt', fileId, receiptType: 'decrypted', senderId: this.myPeerId, senderName: this.identity });
+      };
+    }
   }
 
   // ── Queue ────────────────────────────────────────────────────────────────
@@ -494,6 +523,13 @@ export class Room {
       case 'file_announce': {
         const meta = { id: msg.fileId, name: msg.name, size: msg.size, mimeType: msg.mimeType, encrypted: msg.encrypted, senderId: msg.senderId, senderName: msg.senderName, totalChunks: msg.totalChunks, compression: msg.compression || null };
         this.fileStore.register(meta);
+        // Tell Kotlin the file metadata so it can save correctly on transfer complete.
+        if (typeof window.AndroidRtc !== 'undefined') {
+          window.AndroidRtc.announceFile(
+            msg.fileId, msg.name, msg.mimeType || 'application/octet-stream',
+            msg.size, msg.totalChunks, msg.compression || '', msg.senderId
+          );
+        }
         this.onFileUpdate?.();
         this.onMessage?.({ type: 'file_announce', senderId: msg.senderId, senderName: msg.senderName, fileId: msg.fileId, name: msg.name, size: msg.size });
         break;
@@ -535,6 +571,10 @@ export class Room {
   // ── Chunk reception ──────────────────────────────────────────────────────
 
   async _receiveChunk({ fileId, chunkIndex, totalChunks, chunkBuf, encrypted, fromDC }) {
+    // On Android, inbound DC frames are handled entirely by Kotlin (NativeRtcBridge).
+    // Kotlin reassembles, decrypts, decompresses, and writes to MediaStore natively.
+    // _nativeProgress / _nativeFileDone fire when Kotlin is done — no JS work needed.
+    if (fromDC && typeof window.AndroidRtc !== 'undefined') return;
     if (this._cancelled.has(fileId)) return;
     if (chunkIndex === 0) console.log('[receiveChunk] first chunk', { fileId: fileId.slice(0,8), totalChunks, fromDC, swAvailable: this._swDL.available });
 
@@ -814,38 +854,19 @@ export class Room {
     const b    = blob instanceof Blob ? blob : new Blob([blob], { type: meta?.mimeType || 'application/octet-stream' });
     const name = meta?.name || 'download';
 
-    // On Android, save via the native Kotlin layer (MediaStore / Downloads).
-    // Convert to ArrayBuffer first — avoids the double-allocation of
-    // FileReader.readAsDataURL (which wraps bytes in a data-URL string).
-    // The resulting base64 string is the same size regardless of conversion
-    // method; we just avoid the FileReader async callback and data-URL prefix.
-    if (typeof window.AndroidRtc !== 'undefined' && window.AndroidRtc.saveFile) {
-      // Use FileReader with readAsArrayBuffer → Uint8Array → btoa.
-      // For previewable files we still need a Blob URL for the preview — create
-      // it before we hand the bytes to Kotlin (no second conversion needed).
-      const previewUrl = isPreviewable(meta?.mimeType, name)
-        ? URL.createObjectURL(b)
-        : null;
-
+    // Android: Kotlin handles saving natively via _nativeFileDone callback.
+    // _saveFile is only called from the assembler path (relay fallback, previewable files).
+    // On the DC path, Kotlin already saved the file — this is never reached.
+    // For relay fallback on Android (edge case): still save via Kotlin so it lands in MediaStore.
+    if (typeof window.AndroidRtc !== 'undefined') {
+      const previewUrl = isPreviewable(meta?.mimeType, name) ? URL.createObjectURL(b) : null;
       b.arrayBuffer().then(buf => {
-        const bytes  = new Uint8Array(buf);
-        // btoa requires a binary string — use a typed-array loop (fastest on V8).
-        let   bin    = '';
+        let bin = '';
+        const bytes = new Uint8Array(buf);
         for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-        const b64    = btoa(bin);
-        window.AndroidRtc.saveFile(name, meta?.mimeType || 'application/octet-stream', b64);
-      }).catch(err => {
-        console.error('[_saveFile] arrayBuffer() failed:', err);
-        // Fallback to old FileReader path if arrayBuffer() is somehow unavailable.
-        const reader  = new FileReader();
-        reader.onload = () => {
-          const b64 = reader.result.split(',')[1];
-          window.AndroidRtc.saveFile(name, meta?.mimeType || 'application/octet-stream', b64);
-        };
-        reader.readAsDataURL(b);
-      });
-
-      return previewUrl; // null for non-previewable — correct behaviour
+        window.AndroidRtc.saveFile(name, meta?.mimeType || 'application/octet-stream', btoa(bin));
+      }).catch(err => console.error('[_saveFile] arrayBuffer() failed:', err));
+      return previewUrl;
     }
 
     // Desktop / non-Android path — unchanged.

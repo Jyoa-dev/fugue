@@ -1,101 +1,29 @@
 // ── webrtc_android_bridge.js ─────────────────────────────────────────────────
-// Call initAndroidBridge(WebRTCMesh) after importing WebRTCMesh.
-// When running inside the Android WebView with window.AndroidRtc present it
-// monkey-patches WebRTCMesh so all desktop↔Android connections use native
-// WebRTC instead of the browser stack.
+// Patches WebRTCMesh to use native Kotlin WebRTC on Android.
 //
-// ── Binary port architecture (replaces evalJs + base64 delivery) ─────────────
-//  • MainActivity posts one end of a WebMessagePort to the page as a transferable
-//    in a window message with data === "rtc-port".
-//  • initAndroidBridge() stores the port in _rtcPort and wires port.onmessage.
-//  • Inbound frames (Kotlin→JS): port.onmessage fires with event.data as
-//    ArrayBuffer. Wire format:
-//      [36 bytes peerId ASCII, space-padded][raw frame bytes]
-//    JS slices the first 36 bytes, decodes as UTF-8, trims padding → peerId.
-//    The rest is the raw DC frame passed directly to mesh._handleFrame().
-//    No base64. No main-looper round-trip.
-//  • Outbound frames (JS→Kotlin): sendBinary / sendOnChannel post binary
-//    ArrayBuffers to the port with this header prepended:
-//      [1 byte channel type: 0x00=shared, 0x01..0x04=pool DC 0..3]
-//      [36 bytes peerId ASCII, space-padded]
-//      [frame bytes]
-//    Kotlin's WebMessageCallback receives WebMessage.data as ByteArray,
-//    routes to the correct DataChannel, and sends. Zero base64.
-//  • Fallback: if _rtcPort is not yet set (race during init), the old
-//    AndroidRtc.sendShared/sendPool/@JavascriptInterface path is used.
-//    window._nativeRtcChunk is also kept as a fallback receive path for the
-//    same race window.
+// Architecture:
+//  • Signaling (offer/answer/ICE) flows JS ↔ Kotlin via @JavascriptInterface
+//  • Outbound file chunks: JS encodes to base64, calls AndroidRtc.sendShared/sendPool
+//  • Inbound file chunks: Kotlin receives DC frames, reassembles, decrypts, saves
+//    to MediaStore — JS never touches binary data on the receive path
+//  • JS-only responsibility: UI callbacks (_nativeProgress, _nativeFileDone, etc.)
 //
-// ── Native file picker ────────────────────────────────────────────────────────
-//  • room.js / UI calls window.AndroidRtc.openFilePicker() instead of
-//    triggering an <input type=file> click. Kotlin launches the system picker.
-//  • On completion, Kotlin calls window._nativeFilePicked(jsonArrayStr) with
-//    [{token, name, mime, size}, …]. JS builds synthetic File-like objects and
-//    hands them to room.shareFile() / the existing upload flow.
-//  • JS reads file data via AndroidRtc.readFileChunk(token, offset, length)
-//    (returns base64). This keeps the Chunker.chunkFile generator pattern intact
-//    while never materialising the whole file in JS heap.
-//  • On transfer complete JS calls AndroidRtc.releaseFileToken(token).
-//
-// ── _saveFile port path ───────────────────────────────────────────────────────
-//  • room.js _saveFile() detects AndroidRtc and calls AndroidRtc.saveFile()
-//    with a base64 payload (legacy). The binary port path for received files is
-//    a follow-on optimisation — for now the base64 path is preserved for save.
+// Kotlin → JS callbacks (all small strings, no binary):
+//  _nativeRtcOffer(peerId, sdpJson)
+//  _nativeRtcAnswer(peerId, sdpJson)
+//  _nativeRtcIce(peerId, candidateJson)
+//  _nativeRtcReady(peerId)
+//  _nativeRtcPoolReady(peerId)
+//  _nativeRtcFailed(peerId)
+//  _nativeFilePicked(jsonArray)
+//  _nativeProgress(fileId, ratio)        0.0–1.0
+//  _nativeFileDone(fileId, name, mime)   saved to Downloads
+//  _nativeFileError(fileId, name, msg)   save failed
+//  _nativeRelayReceipt(fileId, peerId)   JS should send relay receipt
 
-// ── Internal log helper ───────────────────────────────────────────────────────
 const _log  = (...a) => console.log ('[android-bridge]', ...a);
 const _dbg  = (...a) => console.debug('[android-bridge]', ...a);
 const _warn = (...a) => console.warn ('[android-bridge]', ...a);
-
-// Binary port — assigned from window.onmessage when Kotlin posts "rtc-port".
-// Shared across all mesh patches so sendBinary/sendOnChannel can use it.
-let _rtcPort = null;
-
-// Set up the port receiver immediately at module load time so we don't miss
-// the postWebMessage if initAndroidBridge() is called slightly after page load.
-// The mesh reference is needed only in _nativeRtcChunk / port.onmessage, so
-// we grab window._webrtcMesh lazily inside the handler.
-window.addEventListener('message', (e) => {
-  if (e.data !== 'rtc-port') return;
-  const port = e.ports?.[0];
-  if (!port) { _warn('rtc-port message received but no port in e.ports'); return; }
-  _rtcPort = port;
-  port.start();
-
-  port.onmessage = (ev) => {
-    // Inbound binary frame: [36-byte peerId][frame]
-    const buf = ev.data;
-    if (!(buf instanceof ArrayBuffer) || buf.byteLength < 36) {
-      _warn('port.onmessage — unexpected data', typeof buf); return;
-    }
-    const peerIdRaw = new TextDecoder().decode(new Uint8Array(buf, 0, 36));
-    const peerId    = peerIdRaw.trimEnd(); // remove space padding
-    const frame     = buf.slice(36);
-
-    const mesh = window._webrtcMesh;
-    if (!mesh) { _warn('port.onmessage — no _webrtcMesh on window'); return; }
-    mesh._handleFrame(peerId, frame);
-  };
-
-  _log('✓ binary RTC port received from Kotlin');
-});
-
-// Peer-id header size used in outbound port messages.
-const _PEER_ID_HDR = 36;
-
-/** Encode outbound frame for the binary port: [channelByte][peerId36][frame]
- *  Returns a String (ISO-8859-1) — Android WebMessagePort cannot receive
- *  ArrayBuffer; the Kotlin side decodes with toByteArray(ISO_8859_1).
- */
-function _portFrame(channelByte, peerId, frameBuffer) {
-  const frameBytes  = frameBuffer instanceof ArrayBuffer ? frameBuffer : frameBuffer.buffer;
-  const frameView   = new Uint8Array(frameBytes);
-  const peerIdBytes = new TextEncoder().encode(peerId.padEnd(_PEER_ID_HDR));
-  let str = String.fromCharCode(channelByte);
-  for (let i = 0; i < _PEER_ID_HDR; i++) str += String.fromCharCode(peerIdBytes[i]);
-  for (let i = 0; i < frameView.length;  i++) str += String.fromCharCode(frameView[i]);
-  return str;
-}
 
 /**
  * Patch WebRTCMesh to use native Android WebRTC when window.AndroidRtc is
@@ -109,12 +37,10 @@ export function initAndroidBridge(WebRTCMesh) {
     : 'no AndroidRtc — desktop mode, no patch applied');
   if (!_isAndroid) return;
   if (WebRTCMesh.prototype._androidBridgeApplied) {
-    _log('already patched — skipping');
-    return;
+    _log('already patched — skipping'); return;
   }
   WebRTCMesh.prototype._androidBridgeApplied = true;
 {
-
   const proto = WebRTCMesh.prototype;
 
   // ── addPeer ───────────────────────────────────────────────────────────────
@@ -132,12 +58,10 @@ export function initAndroidBridge(WebRTCMesh) {
     _log('→ AndroidRtc.createPeerConnection(', peerId.slice(0,8), ')');
     window.AndroidRtc.createPeerConnection(peerId);
     if (this.myPeerId > peerId) {
-      _log('addPeer — Android is initiator for', peerId.slice(0,8),
-        '— calling AndroidRtc.createOffer');
+      _log('addPeer — Android is initiator for', peerId.slice(0,8), '— calling AndroidRtc.createOffer');
       window.AndroidRtc.createOffer(peerId);
     } else {
-      _log('addPeer — Android is responder for', peerId.slice(0,8),
-        '— waiting for desktop rtc_offer via signal channel');
+      _log('addPeer — Android is responder for', peerId.slice(0,8), '— waiting for rtc_offer');
     }
   };
 
@@ -162,7 +86,6 @@ export function initAndroidBridge(WebRTCMesh) {
       _log('removePeer (native) done for', peerId.slice(0,8));
       return;
     }
-    _log('removePeer (JS/browser path) for', peerId.slice(0,8));
     return _origRemovePeer.call(this, peerId);
   };
 
@@ -175,8 +98,7 @@ export function initAndroidBridge(WebRTCMesh) {
     if (type === 'rtc_offer') {
       const existing = this._pcs.get(senderId);
       if (existing && !existing._native) {
-        _warn('rtc_offer from', senderId.slice(0,8),
-          '— real RTCPeerConnection already in _pcs (unexpected); falling through to JS path');
+        _warn('rtc_offer from', senderId.slice(0,8), '— real RTCPeerConnection in _pcs; falling through');
         return _origHandleSignal.call(this, msg);
       }
       if (!existing) {
@@ -192,9 +114,7 @@ export function initAndroidBridge(WebRTCMesh) {
       if (pendingIce?.length) {
         _log('rtc_offer — flushing', pendingIce.length, 'pre-offer ICE candidate(s)');
         this._icePending.delete(senderId);
-        for (const c of pendingIce) {
-          window.AndroidRtc.addIceCandidate(senderId, JSON.stringify(c));
-        }
+        for (const c of pendingIce) window.AndroidRtc.addIceCandidate(senderId, JSON.stringify(c));
       }
       return;
     }
@@ -237,29 +157,17 @@ export function initAndroidBridge(WebRTCMesh) {
   };
 
   // ── sendBinary (shared DC) ────────────────────────────────────────────────
-  // Binary port path: no _splitToFrames, no base64.
-  // The frame goes as a single port message. Kotlin's sendBytes() handles DC
-  // fragmentation (its splitFrame mirrors the old JS _splitToFrames).
+  // JS → Kotlin: encode frame as base64, call @JavascriptInterface sendShared.
+  // Kotlin handles DC fragmentation via splitFrame().
   const _origSendBinary = proto.sendBinary;
   proto.sendBinary = async function(peerId, buffer) {
     const pc = this._pcs.get(peerId);
     if (!pc?._native) return _origSendBinary.call(this, peerId, buffer);
-
     _dbg('sendBinary (native shared DC)', peerId.slice(0,8));
-
-    if (_rtcPort) {
-      // Binary port: channel 0x00 = shared DC.
-      const out = _portFrame(0x00, peerId, buffer);
-      _rtcPort.postMessage(out);
-    } else {
-      // Fallback: base64 via @JavascriptInterface (port not ready yet).
-      _warn('sendBinary — port not ready, falling back to base64 sendShared');
-      const frames = _splitToFrames(buffer);
-      for (const frame of frames) {
-        const b64 = _toB64(frame);
-        const ok  = window.AndroidRtc.sendShared(peerId, b64);
-        if (!ok) throw new Error(`[android-bridge] sendShared failed for ${peerId.slice(0,8)}`);
-      }
+    const frames = _splitToFrames(buffer);
+    for (const frame of frames) {
+      const ok = window.AndroidRtc.sendShared(peerId, _toB64(frame));
+      if (!ok) throw new Error(`[android-bridge] sendShared failed for ${peerId.slice(0,8)}`);
     }
   };
 
@@ -268,7 +176,6 @@ export function initAndroidBridge(WebRTCMesh) {
   proto.getPoolChannels = function(peerId, timeoutMs = 10_000) {
     const pc = this._pcs.get(peerId);
     if (!pc?._native) return _origGetPoolChannels.call(this, peerId, timeoutMs);
-
     _log('getPoolChannels (native)', peerId.slice(0,8));
     if (this._xferPool.has(peerId)) {
       _log('getPoolChannels (native) — pool already ready for', peerId.slice(0,8));
@@ -292,35 +199,20 @@ export function initAndroidBridge(WebRTCMesh) {
     });
   };
 
-  // ── sendOnChannel — native pool proxy ────────────────────────────────────
-  // Binary port path: channel byte 0x01..0x04 = pool DC index 0..3.
-  // No _splitToFrames, no base64. Kotlin handles DC fragmentation.
+  // ── sendOnChannel — native pool DC ───────────────────────────────────────
+  // JS → Kotlin: encode frame as base64, call @JavascriptInterface sendPool.
   const _origSendOnChannel = proto.sendOnChannel;
   proto.sendOnChannel = function(dc, buffer) {
     if (!dc._nativePool) return _origSendOnChannel.call(this, dc, buffer);
-
     const { peerId, index } = dc._nativePool;
     _dbg('sendOnChannel (native pool)', peerId.slice(0,8), '| channel index:', index);
-
     return Promise.resolve().then(() => {
-      if (_rtcPort) {
-        // Binary port: channel byte 0x01..0x04 for pool index 0..3.
-        const channelByte = 0x01 + index;
-        const out = _portFrame(channelByte, peerId, buffer);
-        _rtcPort.postMessage(out);
-      } else {
-        // Fallback: base64 via @JavascriptInterface.
-        _warn('sendOnChannel — port not ready, falling back to base64 sendPool');
-        const frames = _splitToFrames(buffer);
-        for (const frame of frames) {
-          const b64 = _toB64(frame);
-          window.AndroidRtc.sendPool(peerId, index, b64);
-        }
-      }
+      const frames = _splitToFrames(buffer);
+      for (const frame of frames) window.AndroidRtc.sendPool(peerId, index, _toB64(frame));
     });
   };
 
-  // ── Native → JS callbacks ─────────────────────────────────────────────────
+  // ── Kotlin → JS callbacks ─────────────────────────────────────────────────
 
   window._nativeRtcOffer = (peerId, sdpJson) => {
     _log('_nativeRtcOffer — forwarding offer for', peerId.slice(0,8));
@@ -373,16 +265,6 @@ export function initAndroidBridge(WebRTCMesh) {
     mesh.sendSignal({ type: 'rtc_ice', targetId: peerId, candidate: JSON.parse(candidateJson), senderId: mesh.myPeerId });
   };
 
-  // Fallback receive path: used when the binary port is not yet set up.
-  // Once _rtcPort is wired, port.onmessage at the top of this file handles
-  // all frames directly and this callback is never called for new peers.
-  window._nativeRtcChunk = (peerId, b64Payload) => {
-    if (_rtcPort) return; // already handled by port.onmessage — shouldn't fire
-    const mesh = window._webrtcMesh;
-    if (!mesh) { _warn('_nativeRtcChunk — no _webrtcMesh'); return; }
-    mesh._handleFrame(peerId, _fromB64(b64Payload));
-  };
-
   window._nativeRtcFailed = (peerId) => {
     _warn('_nativeRtcFailed — native PC failed for', peerId.slice(0,8));
     const mesh = window._webrtcMesh;
@@ -391,36 +273,23 @@ export function initAndroidBridge(WebRTCMesh) {
     mesh.removePeer(peerId);
   };
 
+  // ── Progress / done / error callbacks from Kotlin ────────────────────────
+  // These are wired in room.js where the fileStore lives.
+  // Defined here as no-ops so they exist before room.js assigns them.
+  window._nativeProgress    = null; // assigned by room.js
+  window._nativeFileDone    = null; // assigned by room.js
+  window._nativeFileError   = null; // assigned by room.js
+  window._nativeRelayReceipt= null; // assigned by room.js
+
   // ── Native file picker callbacks ──────────────────────────────────────────
 
-  /**
-   * Kotlin calls this when the system file picker returns.
-   * files: JSON array string of [{token, name, mime, size}, …]
-   *
-   * Constructs NativeFile objects (match the File API subset used by room.js
-   * Chunker.chunkFile + shareFile) and dispatches them to the upload flow.
-   * JS reads file data via AndroidRtc.readFileChunk(token, offset, length).
-   */
   window._nativeFilePicked = (files) => {
     _log('_nativeFilePicked count=', files.length);
-    // Dispatch a synthetic CustomEvent so any UI layer can subscribe.
-    // room.js / app.js should listen for 'native-files-picked' and call
-    // room.shareFile(nativeFile) for each entry.
     window.dispatchEvent(new CustomEvent('native-files-picked', {
       detail: { files: files.map(f => new NativeFile(f)) }
     }));
   };
 
-  /**
-   * NativeFile — a File-API-compatible wrapper around a Kotlin-side picked file.
-   * Supports .name, .size, .type (all File properties used by room.js).
-   * Supports arrayBuffer() and slice() used by Chunker.chunkFile — both
-   * implemented via AndroidRtc.readFileChunk (base64 per-chunk).
-   *
-   * IMPORTANT: Chunker.chunkFile() calls slice() to read ranges. We implement
-   * slice() to return a NativeBlob that reads the given byte range on demand via
-   * readFileChunk. This means file data is read in chunks, never fully in heap.
-   */
   class NativeFile {
     constructor({ token, name, mime, size }) {
       this._token = token;
@@ -429,41 +298,21 @@ export function initAndroidBridge(WebRTCMesh) {
       this.type   = mime;
       this.lastModified = Date.now();
     }
-
-    /** Read this.size bytes starting at 0 — used by Chunker for small files. */
-    async arrayBuffer() {
-      return _readNativeRange(this._token, 0, this.size);
-    }
-
-    /** Mimic Blob.slice — Chunker.chunkFile calls file.slice(start, end). */
+    async arrayBuffer() { return _readNativeRange(this._token, 0, this.size); }
     slice(start = 0, end = this.size) {
       return new NativeBlob(this._token, start, end - start, this.type);
     }
-
-    /** Release the Kotlin-side token when done. */
-    release() {
-      window.AndroidRtc.releaseFileToken(this._token);
-    }
+    release() { window.AndroidRtc.releaseFileToken(this._token); }
   }
 
   class NativeBlob {
     constructor(token, offset, length, type) {
-      this._token  = token;
-      this._offset = offset;
-      this._length = length;
-      this.size    = length;
-      this.type    = type;
+      this._token = token; this._offset = offset;
+      this._length = length; this.size = length; this.type = type;
     }
-    async arrayBuffer() {
-      return _readNativeRange(this._token, this._offset, this._length);
-    }
+    async arrayBuffer() { return _readNativeRange(this._token, this._offset, this._length); }
   }
 
-  /**
-   * Read [length] bytes starting at [offset] from a picked file via Kotlin.
-   * Returns an ArrayBuffer. Kotlin returns base64 (per-call cost acceptable
-   * because Chunker.chunkFile reads at most one chunk per call).
-   */
   async function _readNativeRange(token, offset, length) {
     if (length <= 0) return new ArrayBuffer(0);
     const b64 = window.AndroidRtc.readFileChunk(token, offset, length);
@@ -471,7 +320,7 @@ export function initAndroidBridge(WebRTCMesh) {
     return _fromB64(b64);
   }
 
-  // ── Frame helpers (fallback base64 path only) ─────────────────────────────
+  // ── Frame helpers (outbound only) ─────────────────────────────────────────
 
   const DC_CHUNK = 64 * 1024;
 
@@ -508,6 +357,6 @@ export function initAndroidBridge(WebRTCMesh) {
     return bytes.buffer;
   }
 
-  _log('✓ WebRTCMesh patched for native WebRTC (binary port path active)');
+  _log('✓ WebRTCMesh patched for native WebRTC');
 } // end _isAndroid block
 } // end initAndroidBridge
