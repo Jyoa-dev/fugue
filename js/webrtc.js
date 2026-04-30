@@ -359,6 +359,13 @@ export class WebRTCMesh extends EventTarget {
           this._icePending.delete(senderId);
           for (const c of buffered) { try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch {} }
         }
+        // If the offer came from an Android peer, create the ordered direct-send
+        // DC before the answer so it's negotiated in this round-trip (no renegotiation).
+        // The initiator path does this in addPeer(); responder must mirror it here.
+        if (msg._android && !this._androidDcs.has(senderId)) {
+          const adc = pc.createDataChannel('android-direct', { ordered: true });
+          this._setupAndroidDC(senderId, adc);
+        }
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         this.sendSignal({ type: 'rtc_answer', targetId: senderId, sdp: pc.localDescription, senderId: this.myPeerId, ...(_isSafari && { _safari: true }) });

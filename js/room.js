@@ -842,7 +842,7 @@ export class Room {
     // Starting at BUF_MIN (32 KB) lets it grow upward from the first fast drain —
     // one small stall on chunk 1 instead of multiple large stalls early in the file.
     if (isAndroidPeer) {
-      const dc = this._rtc._dcs?.get(requesterId);
+      const dc = this._rtc._androidDcs?.get(requesterId) ?? this._rtc._dcs?.get(requesterId);
       if (dc && dc._bufHigh > 32 * 1024) {
         dc._bufHigh = 32 * 1024; // BUF_MIN — will grow via _drainBuffer adaptation
         console.log('[sendChunks] Android peer — seeding dc._bufHigh at BUF_MIN for', requesterId.slice(0, 8));
