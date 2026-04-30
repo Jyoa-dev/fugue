@@ -24,7 +24,7 @@ const DC_CHUNK = 64 * 1024; // 64 KB — required for Safari compatibility
 //
 // The RESUME threshold (bufferedAmountLowThreshold) is set to high/2 so the
 // sender wakes up while there is still room in the pipe — no idle stall.
-const BUF_MIN = 128  * 1024;        //  128 KB floor  (was 512 KB — too large for cellular)
+const BUF_MIN = 64   * 1024;        //  64 KB floor — conservative for Android native WebRTC SCTP
 const BUF_MAX =  16  * 1024 * 1024; //   16 MB ceiling
 
 function initialBufHigh() {
@@ -551,9 +551,11 @@ export class WebRTCMesh extends EventTarget {
         }
         if (cur >= lastBuffered) {
           stalledTicks++;
-          if (stalledTicks >= 10) { // 10 × 50 ms = 500 ms with no progress
+          if (stalledTicks >= 60) { // 60 × 50 ms = 3000 ms with no progress
+            // Android native WebRTC SCTP ramps up slowly — tolerate longer stalls
+            // before giving up. 500 ms was too aggressive for native stack peers.
             console.warn('[drain] SCTP stall on', dc.label,
-              '| buffered:', cur, 'B unchanged for 500 ms — force-resolving');
+              '| buffered:', cur, 'B unchanged for 3000 ms — force-resolving');
             forceResolved = true;
             dc.removeEventListener('bufferedamountlow', resolve);
             resolve('stall');
