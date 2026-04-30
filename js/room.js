@@ -402,10 +402,18 @@ export class Room {
     if (typeof window.AndroidRtc !== 'undefined') {
       window._nativeProgress = (fileId, ratio) => {
         this.fileStore.updateProgress(fileId, ratio);
+        // Track received chunk count so requestFile() can resume from the
+        // correct startChunk instead of always restarting from 0.
+        const progEntry = this.fileStore.get(fileId);
+        if (progEntry?.totalChunks) {
+          if (!this._androidChunksReceived) this._androidChunksReceived = new Map();
+          this._androidChunksReceived.set(fileId, Math.floor(ratio * progEntry.totalChunks));
+        }
         this.onFileUpdate?.();
       };
 
       window._nativeFileDone = (fileId, name, mime) => {
+        this._androidChunksReceived?.delete(fileId);
         this.fileStore.setStatus(fileId, 'done');
         this.fileStore.updateProgress(fileId, 1);
         this.onFileUpdate?.();
@@ -413,6 +421,7 @@ export class Room {
       };
 
       window._nativeFileError = (fileId, name, msg) => {
+        this._androidChunksReceived?.delete(fileId);
         console.error('[native-save] error', name, msg);
         this.fileStore.setStatus(fileId, 'error');
         this.onFileUpdate?.();
@@ -576,6 +585,22 @@ export class Room {
         this.fileStore.addReceipt(msg.fileId, msg.senderId, msg.senderName, msg.receiptType);
         this.onFileUpdate?.();
         this.onMessage?.({ type: 'system', text: `${msg.senderName} ${msg.receiptType === 'downloaded' ? 'downloaded' : msg.receiptType === 'decrypted' ? 'decrypted' : 'received'} a file`, subtype: 'receipt' });
+        break;
+
+      case 'transfer_pause':
+        // Receiver paused — stop sending chunks for this file.
+        if (msg.targetId === this.myPeerId) {
+          this._cancelled.add(msg.fileId);
+          console.log('[sendChunks] paused by receiver, fileId=', msg.fileId.slice(0, 8));
+        }
+        break;
+
+      case 'transfer_cancel':
+        // Receiver cancelled — stop sending and forget the file request.
+        if (msg.targetId === this.myPeerId) {
+          this._cancelled.add(msg.fileId);
+          console.log('[sendChunks] cancelled by receiver, fileId=', msg.fileId.slice(0, 8));
+        }
         break;
 
       case 'manifest':
@@ -742,6 +767,9 @@ export class Room {
   // ── File sending ─────────────────────────────────────────────────────────
 
   async _sendChunks(fileId, requesterId, startChunk = 0) {
+    // Clear any pause/cancel flag from a previous request for this file so a
+    // resume (new file_request with startChunk > 0) actually sends chunks.
+    this._cancelled.delete(fileId);
     console.log('[sendChunks] start', { fileId: fileId.slice(0,8), requesterId: requesterId.slice(0,8), startChunk });
     const entry = this.fileStore.get(fileId);
     if (!entry?.file) { console.warn('[sendChunks] no entry.file — aborting'); return; }
@@ -1030,16 +1058,29 @@ export class Room {
     // in the same session without a fresh announce.
     if (typeof window.AndroidRtc !== 'undefined') window.AndroidRtc.resumeTransfer(fileId);
 
-    // Resume detection: if a partial assembler exists in _pending, find the
-    // first chunk index not yet received so the sender can skip ahead.
-    // Fresh download: no assembler — clean slate, start from 0.
-    const asm = this._pending.get(fileId);
     let startChunk = 0;
-    if (asm) {
-      while (asm.chunks.has(startChunk)) startChunk++;
-      console.log('[requestFile] resuming from chunk', startChunk, '/', asm.total);
+
+    if (typeof window.AndroidRtc !== 'undefined') {
+      // Android: JS assembler (_pending) is never populated because _receiveChunk
+      // exits early on the DC path. Use the chunk count tracked via _nativeProgress.
+      const received = this._androidChunksReceived?.get(fileId) || 0;
+      if (received > 0) {
+        startChunk = received;
+        console.log('[requestFile] Android resuming from chunk', startChunk);
+      } else {
+        this.fileStore.updateProgress(fileId, 0);
+      }
     } else {
-      this.fileStore.updateProgress(fileId, 0);
+      // Resume detection: if a partial assembler exists in _pending, find the
+      // first chunk index not yet received so the sender can skip ahead.
+      // Fresh download: no assembler — clean slate, start from 0.
+      const asm = this._pending.get(fileId);
+      if (asm) {
+        while (asm.chunks.has(startChunk)) startChunk++;
+        console.log('[requestFile] resuming from chunk', startChunk, '/', asm.total);
+      } else {
+        this.fileStore.updateProgress(fileId, 0);
+      }
     }
 
     this.fileStore.setStatus(fileId, 'downloading');
@@ -1058,6 +1099,12 @@ export class Room {
     // Without this, Kotlin's assembler keeps writing to disk even after JS pauses
     // because DC frames arrive directly in onMessage() with no JS involvement.
     if (typeof window.AndroidRtc !== 'undefined') window.AndroidRtc.cancelTransfer(fileId);
+    // Tell the sender to stop transmitting — without this the sender keeps
+    // pushing chunks over the DC regardless of our local cancelled flag.
+    const pauseEntry = this.fileStore.get(fileId);
+    if (pauseEntry?.senderId && pauseEntry.senderId !== this.myPeerId) {
+      this.relay.send({ type: 'transfer_pause', fileId, targetId: pauseEntry.senderId });
+    }
     this.fileStore.setStatus(fileId, 'paused');
     // Progress is preserved — do not reset to 0.
     this.onFileUpdate?.();
@@ -1066,10 +1113,16 @@ export class Room {
   cancelDownload(fileId) {
     this._cancelled.add(fileId);
     this._pending.delete(fileId);
+    this._androidChunksReceived?.delete(fileId);
     if (this._swActive.has(fileId)) { this._swDL.abort(fileId); this._swActive.delete(fileId); }
     this._speedMap.delete(fileId);
     // Tell Kotlin to drop inbound chunks and clean up the temp file.
     if (typeof window.AndroidRtc !== 'undefined') window.AndroidRtc.cancelTransfer(fileId);
+    // Tell the sender to stop transmitting.
+    const cancelEntry = this.fileStore.get(fileId);
+    if (cancelEntry?.senderId && cancelEntry.senderId !== this.myPeerId) {
+      this.relay.send({ type: 'transfer_cancel', fileId, targetId: cancelEntry.senderId });
+    }
     this.fileStore.setStatus(fileId, 'available');
     this.fileStore.updateProgress(fileId, 0);
     this.onFileUpdate?.();
