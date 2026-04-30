@@ -17,14 +17,31 @@ export const Chunker = (() => {
         let index = 0;
         let remaining = file.size;
         while (remaining > 0) {
-          const readSize       = Math.min(chunkSize, remaining);
-          const { value, done } = await reader.read(new Uint8Array(new ArrayBuffer(readSize)));
-          if (done) break;
-          remaining -= value.byteLength;
-          // slice() here copies out of the BYOB buffer so we can hand off
-          // ownership to the crypto worker without racing the next read.
-          yield { index, total, data: value.buffer.slice(0, value.byteLength), done: remaining <= 0 };
+          // BYOB streams may return short reads (value.byteLength < requested size).
+          // A single reader.read() call is NOT guaranteed to fill the buffer.
+          // Without coalescing, short reads cause the loop to yield more chunks than
+          // `total`, producing out-of-range indices that the receiver drops and
+          // leaving the tail of the file undelivered — transfer stalls at 99%.
+          // Fix: keep reading into the same staging buffer until either the chunk
+          // is full or the stream signals EOF, then yield exactly one chunk.
+          const chunkBytes = Math.min(chunkSize, remaining);
+          const staging    = new Uint8Array(chunkBytes);
+          let filled = 0;
+          let eof    = false;
+          while (filled < chunkBytes) {
+            const { value, done } = await reader.read(
+              new Uint8Array(new ArrayBuffer(chunkBytes - filled))
+            );
+            if (done || !value?.byteLength) { eof = true; break; }
+            staging.set(value, filled);
+            filled += value.byteLength;
+          }
+          if (!filled) break;
+          remaining -= filled;
+          // slice() copies out of staging so the crypto worker gets sole ownership.
+          yield { index, total, data: staging.buffer.slice(0, filled), done: remaining <= 0 || eof };
           index++;
+          if (eof) break;
         }
         reader.releaseLock();
         return;
