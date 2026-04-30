@@ -991,6 +991,10 @@ export class Room {
   requestFile(fileId) {
     console.log('[requestFile] sending file_request', fileId.slice(0,8));
     this._cancelled.delete(fileId);
+    // Tell Kotlin to clear its cancelled flag so inbound chunks are accepted again.
+    // announceFile() also clears it, but this covers re-downloading a paused file
+    // in the same session without a fresh announce.
+    if (typeof window.AndroidRtc !== 'undefined') window.AndroidRtc.resumeTransfer(fileId);
 
     // Resume detection: if a partial assembler exists in _pending, find the
     // first chunk index not yet received so the sender can skip ahead.
@@ -1016,6 +1020,10 @@ export class Room {
     // chunk index instead of restarting from 0.
     // SW path has no resumable state: abort + delete is still correct there.
     if (this._swActive.has(fileId)) { this._swDL.abort(fileId); this._swActive.delete(fileId); }
+    // Tell Kotlin to stop accepting inbound chunks for this fileId.
+    // Without this, Kotlin's assembler keeps writing to disk even after JS pauses
+    // because DC frames arrive directly in onMessage() with no JS involvement.
+    if (typeof window.AndroidRtc !== 'undefined') window.AndroidRtc.cancelTransfer(fileId);
     this.fileStore.setStatus(fileId, 'paused');
     // Progress is preserved — do not reset to 0.
     this.onFileUpdate?.();
@@ -1026,6 +1034,8 @@ export class Room {
     this._pending.delete(fileId);
     if (this._swActive.has(fileId)) { this._swDL.abort(fileId); this._swActive.delete(fileId); }
     this._speedMap.delete(fileId);
+    // Tell Kotlin to drop inbound chunks and clean up the temp file.
+    if (typeof window.AndroidRtc !== 'undefined') window.AndroidRtc.cancelTransfer(fileId);
     this.fileStore.setStatus(fileId, 'available');
     this.fileStore.updateProgress(fileId, 0);
     this.onFileUpdate?.();
