@@ -863,9 +863,10 @@ export class Room {
     }
 
     const sendOne = async (chunk) => {
-      if (this._cancelled.has(fileId)) return;
+      if (this._cancelled.has(fileId) || aborted) return;
       let chunkBuf = chunk.data;
       if (this._crypto) chunkBuf = await this._crypto.encrypt(chunk.data, 'session');
+      if (this._cancelled.has(fileId) || aborted) return; // recheck after async encrypt
       const frame = encodeDCChunk(fileIdBytes, chunk.index, chunk.total, !!this._crypto, chunkBuf);
 
       if (useLan) {
@@ -917,20 +918,26 @@ export class Room {
     const lanes = new Array(activeConcurrency).fill(Promise.resolve());
     let lane = 0;
     let chunkCount = 0;
+    let aborted = false;
     for await (const chunk of Chunker.chunkFile(entry.file, effectiveChunkSize, startChunk)) {
-      if (this._cancelled.has(fileId)) break;
+      if (this._cancelled.has(fileId)) { aborted = true; break; }
       const l = lane++ % activeConcurrency;
-      await lanes[l];                          // free the slot first — this is what
-      if (this._cancelled.has(fileId)) break;  // gates the generator's next read
+      await lanes[l];                                         // free the slot first
+      if (this._cancelled.has(fileId)) { aborted = true; break; }
       if (chunkCount === 0) console.log('[sendChunks] first chunk, total:', chunk.total);
       chunkCount++;
-      lanes[l] = sendOne(chunk);               // no .then() chain needed; slot was awaited
+      lanes[l] = sendOne(chunk);
     }
-    await Promise.all(lanes);
-    console.log('[sendChunks] done, sent', chunkCount, 'chunks');
+    // Drain in-flight lanes, but ignore errors from closed DCs when aborted.
+    if (aborted) {
+      await Promise.allSettled(lanes);
+    } else {
+      await Promise.all(lanes);
+    }
+    console.log('[sendChunks] done, sent', chunkCount, 'chunks', aborted ? '(aborted)' : '');
 
 
-    if (!this._cancelled.has(fileId)) {
+    if (!aborted && !this._cancelled.has(fileId)) {
       this.fileStore.addReceipt(fileId, requesterId, this.peers.get(requesterId)?.identity || requesterId, 'sent');
       this.onFileUpdate?.();
     }
@@ -1062,12 +1069,14 @@ export class Room {
 
     if (typeof window.AndroidRtc !== 'undefined') {
       // Android: JS assembler (_pending) is never populated because _receiveChunk
-      // exits early on the DC path. Use the chunk count tracked via _nativeProgress.
-      const received = this._androidChunksReceived?.get(fileId) || 0;
-      if (received > 0) {
-        startChunk = received;
+      // exits early on the DC path. Ask Kotlin directly for the exact chunk count
+      // written to the partial temp file (returns -1 if no assembler / fresh download).
+      const nativeCount = window.AndroidRtc.getReceivedChunkCount?.(fileId) ?? -1;
+      if (nativeCount > 0) {
+        startChunk = nativeCount;
         console.log('[requestFile] Android resuming from chunk', startChunk);
       } else {
+        this._androidChunksReceived?.delete(fileId);
         this.fileStore.updateProgress(fileId, 0);
       }
     } else {
@@ -1095,10 +1104,11 @@ export class Room {
     // chunk index instead of restarting from 0.
     // SW path has no resumable state: abort + delete is still correct there.
     if (this._swActive.has(fileId)) { this._swDL.abort(fileId); this._swActive.delete(fileId); }
-    // Tell Kotlin to stop accepting inbound chunks for this fileId.
-    // Without this, Kotlin's assembler keeps writing to disk even after JS pauses
-    // because DC frames arrive directly in onMessage() with no JS involvement.
-    if (typeof window.AndroidRtc !== 'undefined') window.AndroidRtc.cancelTransfer(fileId);
+    // Tell Kotlin to stop accepting inbound chunks but KEEP the partial temp file
+    // so resume can continue writing at the correct chunk offset.
+    // pauseTransfer() sets the cancelled flag without calling asm.abort(),
+    // preserving the RandomAccessFile and temp file for resumption.
+    if (typeof window.AndroidRtc !== 'undefined') window.AndroidRtc.pauseTransfer(fileId);
     // Tell the sender to stop transmitting — without this the sender keeps
     // pushing chunks over the DC regardless of our local cancelled flag.
     const pauseEntry = this.fileStore.get(fileId);
