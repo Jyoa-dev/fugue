@@ -785,6 +785,12 @@ export class Room {
       console.log('[lan] useLan =', useLan);
     }
 
+    // Android native path: bypass pool DC entirely.
+    // Kotlin owns the DataChannels directly — no JS transport envelope,
+    // no pool striping needed. sendBinary → AndroidRtc.sendShared → Kotlin
+    // sendBytes → splitFrame → dc.send. One call per app chunk.
+    const isAndroidPeer = this._rtc._pcs.get(requesterId)?._native === true;
+
     const sendOne = async (chunk) => {
       if (this._cancelled.has(fileId)) return;
       let chunkBuf = chunk.data;
@@ -792,16 +798,20 @@ export class Room {
       const frame = encodeDCChunk(fileIdBytes, chunk.index, chunk.total, !!this._crypto, chunkBuf);
 
       if (useLan) {
-        // Convert to base64 — JavascriptInterface only accepts strings.
         const b64 = btoa(String.fromCharCode(...new Uint8Array(frame)));
         const ok  = window.AndroidRtc.sendLanChunk(requesterId, b64);
         if (!ok) {
-          // TCP session dropped mid-transfer — fall back immediately.
           console.warn('[lan] sendLanChunk failed at chunk', chunk.index, '— falling back to WebRTC');
           useLan = false;
         } else {
-          return; // sent via TCP — skip WebRTC DC
+          return;
         }
+      }
+
+      if (isAndroidPeer) {
+        // Direct shared DC send — Kotlin handles SCTP fragmentation natively.
+        await this._rtc.sendBinary(requesterId, frame);
+        return;
       }
 
       const dc = dcPool[chunk.index % dcPool.length];
