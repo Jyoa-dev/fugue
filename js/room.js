@@ -455,6 +455,18 @@ export class Room {
           await this._crypto.deriveKey(this.passphrase, msg.salt, 'session');
           this._crypto._workers.forEach(w => { w._keyId = 'session'; });
           this._sessionKeyReady?.();
+          // Hand the session key material to Kotlin so it can decrypt inbound
+          // DC chunks natively. Must be called after deriveKey resolves so both
+          // sides derive from the same welcome salt with the same parameters.
+          // Kotlin only supports AES-256-GCM / PBKDF2-SHA-256 — if the room
+          // was opened with a different cipher/kdf combo Kotlin logs a warning
+          // and skips derivation; those transfers will fail decrypt on Android.
+          if (typeof window.AndroidRtc !== 'undefined') {
+            const cipher = this.settings?.cipher || 'AES-256-GCM';
+            const kdf    = this.settings?.kdf    || 'PBKDF2-SHA-256';
+            console.log('[crypto] → AndroidRtc.setSessionKey cipher=', cipher, 'kdf=', kdf);
+            window.AndroidRtc.setSessionKey(this.passphrase, msg.salt, cipher, kdf);
+          }
         }
         this.myPeerId = msg.peerId;
         this.peers.set(msg.peerId, { identity: this.identity, color: Identity.colorFor(this.identity), isMe: true });
