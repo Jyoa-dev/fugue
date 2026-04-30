@@ -8,25 +8,25 @@ const ICE_SERVERS = [
   { urls: 'stun:stun.relay.metered.ca:80'   },
 ];
 
-// Maximum payload bytes per _sendOnDC fragment — 3-tier by peer type.
+// Maximum payload bytes per _sendOnDC fragment — 2-tier by peer type.
 // _sendOnDC prepends a 12-byte transport header (transferId + total + index)
 // to every dc.send() call, so the raw dc.send() size is always (12 + chunk).
 // Each constant must therefore be (browser ceiling − 12) so the wire frame
 // never exceeds the hard ceiling that throws a DOMException.
 //
-//   Android peers   → 16 KB  (libwebrtc SCTP receive window on native Android
-//                             stack; Android uses sendDirect which bypasses
-//                             _sendOnDC entirely, so the header offset does not
-//                             apply — value kept for _chunkSizeFor reference)
 //   Safari peers    → 64 KB  (WebKit hard cap is exactly 65536 B;
 //                             65536 − 12 = 65524 B payload ceiling)
 //   Chrome/Firefox  → 256 KB (libwebrtc kMaxSctpMessageSize = 262144 B;
 //                             262144 − 12 = 262132 B payload ceiling)
 //
+// Android peers never reach _sendOnDC — they use sendDirect (shared DC, raw
+// dc.send() with no transport wrapper) or NativeBlob.sendChunk() (Kotlin fast
+// path). The 256 KB app-chunk cap for Android is enforced in room.js
+// (_sendChunks ANDROID_CHUNK_CAP) against NativeRtcBridge.kt's DC_CHUNK.
+//
 // _sendOnDC reads _chunkSizeFor(peerId) at call time so the right size is used
 // per-peer. Small messages (chat etc.) still hit the total===1 fast-path with
 // zero reassembly overhead regardless of which tier is active.
-const DC_CHUNK_ANDROID = 16  * 1024;          // 16 KB  (sendDirect path — header not added)
 const DC_CHUNK_SAFARI  = 64  * 1024 - 12;     // 65524 B — keeps dc.send() ≤ 65536 B
 const DC_CHUNK_DESKTOP = 256 * 1024 - 12;     // 262132 B — keeps dc.send() ≤ 262144 B
 
@@ -90,6 +90,8 @@ export class WebRTCMesh extends EventTarget {
     this._xferBufHigh     = new Map(); // peerId → shared back-pressure budget for pool DCs
     /** @type {Set<string>} peers identified as Android native-WebRTC (via _android flag in rtc_offer or rtc_answer) */
     this._androidPeers    = new Set();
+    /** @type {Set<string>} peers identified as Safari (via _safari flag in rtc_offer or rtc_answer) */
+    this._safariPeers     = new Set();
     // Per-DC write queues — gives each pool channel an independent drain loop so
     // concurrent sendOnChannel calls on different DCs overlap instead of serialising.
     /** @type {WeakMap<RTCDataChannel, { pending: Array<{buffer:ArrayBuffer, resolve:()=>void}>, running:boolean }>} */
@@ -145,7 +147,7 @@ export class WebRTCMesh extends EventTarget {
       this._openPool(peerId, pc);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      this.sendSignal({ type: 'rtc_offer', targetId: peerId, sdp: pc.localDescription, senderId: this.myPeerId });
+      this.sendSignal({ type: 'rtc_offer', targetId: peerId, sdp: pc.localDescription, senderId: this.myPeerId, ...(_isSafari && { _safari: true }) });
     }
   }
 
@@ -174,6 +176,7 @@ export class WebRTCMesh extends EventTarget {
     this._xferPoolBuf.delete(peerId);
     this._xferBufHigh.delete(peerId);
     this._androidPeers.delete(peerId);
+    this._safariPeers.delete(peerId);
     for (const [key, asm] of this._assemblers) {
       if (asm.peerId === peerId) this._assemblers.delete(key);
     }
@@ -327,6 +330,17 @@ export class WebRTCMesh extends EventTarget {
           '| total android peers:', this._androidPeers.size,
         );
       }
+      // ── Safari peer detection (offer path) ─────────────────────────────
+      // Safari stamps _safari:true on offers it sends. Cap chunk size for this
+      // peer to DC_CHUNK_SAFARI (64 KB − 12) to stay within WebKit's SCTP ceiling.
+      if (msg._safari && !this._safariPeers.has(senderId)) {
+        this._safariPeers.add(senderId);
+        console.log(
+          '[mesh] 🧭 peer', senderId.slice(0, 8),
+          '— Safari detected via offer, capping chunks to', DC_CHUNK_SAFARI, 'B',
+          '| total safari peers:', this._safariPeers.size,
+        );
+      }
       if (pc.signalingState !== 'stable') return;
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
@@ -338,7 +352,7 @@ export class WebRTCMesh extends EventTarget {
         }
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        this.sendSignal({ type: 'rtc_answer', targetId: senderId, sdp: pc.localDescription, senderId: this.myPeerId });
+        this.sendSignal({ type: 'rtc_answer', targetId: senderId, sdp: pc.localDescription, senderId: this.myPeerId, ...(_isSafari && { _safari: true }) });
       } catch (e) {
         if (e instanceof DOMException && e.name === 'InvalidStateError') return;
         console.warn('rtc_offer handling failed:', e);
@@ -358,6 +372,16 @@ export class WebRTCMesh extends EventTarget {
           '[mesh] 📱 peer', senderId.slice(0, 8),
           '— Android detected, native WebRTC path active (NativeRtcBridge.kt)',
           '| total android peers:', this._androidPeers.size,
+        );
+      }
+      // ── Safari peer detection (answer path) ────────────────────────────
+      // Safari stamps _safari:true on every rtc_answer it sends.
+      if (msg._safari && !this._safariPeers.has(senderId)) {
+        this._safariPeers.add(senderId);
+        console.log(
+          '[mesh] 🧭 peer', senderId.slice(0, 8),
+          '— Safari detected via answer, capping chunks to', DC_CHUNK_SAFARI, 'B',
+          '| total safari peers:', this._safariPeers.size,
         );
       }
       if (pc && pc.signalingState === 'have-local-offer') {
@@ -571,11 +595,15 @@ export class WebRTCMesh extends EventTarget {
   }
 
   // Returns the per-call dc.send() ceiling for the given peer:
-  //   Android → 16 KB, Safari (local browser) → 64 KB, desktop → 256 KB.
+  //   Safari (local browser or remote peer) → 64 KB, desktop → 256 KB.
+  // Android peers never reach this — they use sendDirect / NativeBlob.sendChunk().
   // dc._peerId is stamped in _setupDC and _openPool so every DC carries its peer.
+  // Two independent Safari checks apply:
+  //   _isSafari        — THIS browser is Safari, so all dc.send() calls are capped.
+  //   _safariPeers     — the REMOTE peer is Safari; their SCTP stack can't reassemble
+  //                      frames > 64 KB, so we must cap even from a desktop sender.
   _chunkSizeFor(peerId) {
-    if (peerId && this._androidPeers.has(peerId)) return DC_CHUNK_ANDROID;
-    if (_isSafari)                                return DC_CHUNK_SAFARI;
+    if (_isSafari || (peerId && this._safariPeers.has(peerId))) return DC_CHUNK_SAFARI;
     return DC_CHUNK_DESKTOP;
   }
 

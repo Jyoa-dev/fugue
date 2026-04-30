@@ -824,14 +824,13 @@ export class Room {
 
     // ── Android chunk size cap ────────────────────────────────────────────
     // For Android native peers we bypass _sendOnDC's transport wrapper entirely
-    // (sendDirect calls dc.send() once per app frame). Chrome/libwebrtc enforces
-    // a 65535-byte SCTP message limit by default, so each dc.send() call must be
-    // ≤ 65535 bytes. A 64 KB plaintext chunk + 26-byte header + 28-byte AES-GCM
-    // overhead = 65 582 bytes — just over the limit. Cap plaintext at 64 KB - 54
-    // (header + crypto) = 65 481 bytes to stay safely under the ceiling.
+    // (sendDirect calls dc.send() once per app frame). NativeRtcBridge.kt sets
+    // DC_CHUNK = 256 KB so libwebrtc is configured to accept frames up to that
+    // size. Cap plaintext at 256 KB - 54 (26-byte DC header + 28-byte AES-GCM
+    // overhead) = 262 090 bytes so the framed message stays exactly at DC_CHUNK.
     // Desktop-to-desktop transfers are unaffected: they use _sendOnDC which splits
     // automatically and the receiver reassembles via _handleFrame.
-    const ANDROID_CHUNK_CAP = 64 * 1024 - 54; // 65 482 bytes
+    const ANDROID_CHUNK_CAP = 256 * 1024 - 54; // 262 090 bytes — matches DC_CHUNK in NativeRtcBridge.kt
     const effectiveChunkSize = isAndroidPeer
       ? Math.min(entry.chunkSize, ANDROID_CHUNK_CAP)
       : entry.chunkSize;
