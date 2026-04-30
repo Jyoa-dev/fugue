@@ -855,8 +855,7 @@ export class Room {
 
     // Seed log — _setupAndroidDC initialises _bufHigh at BUF_MIN already.
     if (isAndroidPeer) {
-      console.log('[sendChunks] Android peer — android-direct DC ready for', requesterId.slice(0, 8),
-        '| bufHigh:', (this._rtc._androidDcs?.get(requesterId)?._bufHigh ?? 0) / 1024, 'KB');
+      console.log('[sendChunks] Android peer — sendDirect path for', requesterId.slice(0, 8));
     }
 
     const sendOne = async (chunk) => {
@@ -888,23 +887,24 @@ export class Room {
       }
 
       if (isAndroidPeer) {
-        // Android peers use the pool DCs (sendOnChannel) just like desktop.
-        // Kotlin's NativeAssembler handles unordered arrival via RandomAccessFile.seek —
-        // each chunk is written at index*stride regardless of delivery order.
-        // sendDirect on a single DC was serialising crypto workers and causing
-        // SCTP buffer stalls; striping across 4 pool DCs with full SEND_CONCURRENCY
-        // keeps all crypto workers saturated and matches the desktop send path.
+        // sendDirect: raw dc.send() with no _sendOnDC transport wrapper.
+        // _sendOnDC adds its own 12-byte fragmentation header which Kotlin's
+        // parseDCFrame() does not understand — frames must arrive as-is with
+        // only the 26-byte room.js header at offset 0.
+        await this._rtc.sendDirect(requesterId, frame);
+        return;
       }
 
       const dc = dcPool[chunk.index % dcPool.length];
       await this._rtc.sendOnChannel(dc, frame);
     };
 
-    // Both Android and desktop use the full pool with SEND_CONCURRENCY lanes.
-    // Android's NativeAssembler handles unordered chunks natively; the crypto
-    // workers are the bottleneck, not the DC count — full concurrency keeps them
-    // saturated across all 4 pool DCs.
-    const activeConcurrency = SEND_CONCURRENCY;
+    // Android single DC: 8 lanes — crypto workers are shared but the single
+    // ordered DC is the bottleneck, not parallelism. More lanes just pile up
+    // in the write queue without benefit.
+    // Desktop pool (4 DCs): 32 lanes — 8 per channel keeps every crypto worker
+    // and each pool DC continuously saturated.
+    const activeConcurrency = isAndroidPeer ? 8 : SEND_CONCURRENCY;
     const lanes = new Array(activeConcurrency).fill(Promise.resolve());
     let lane = 0;
     let chunkCount = 0;
