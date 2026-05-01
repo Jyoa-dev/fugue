@@ -303,6 +303,16 @@ export function initAndroidBridge(WebRTCMesh) {
   window._nativeFileError   = null; // assigned by room.js
   window._nativeRelayReceipt= null; // assigned by room.js
 
+  // Inbound non-chunk frames (chat, lan_caps) forwarded from Kotlin.
+  // Mirrors the 'binary' CustomEvent that webrtc.js _handleFrame() dispatches
+  // on desktop so room.js receives them identically on both platforms.
+  window._nativeBinary = (peerId, b64) => {
+    const mesh = window._webrtcMesh;
+    if (!mesh) { _warn('_nativeBinary — no _webrtcMesh'); return; }
+    _dbg('_nativeBinary from', peerId.slice(0,8), 'len=', b64.length);
+    mesh.dispatchEvent(new CustomEvent('binary', { detail: { peerId, buffer: _fromB64(b64) } }));
+  };
+
   // ── Native file picker callbacks ──────────────────────────────────────────
 
   window._nativeFilePicked = (files) => {
