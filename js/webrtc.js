@@ -60,7 +60,7 @@ function initialBufHigh() {
 // Chunks are striped across them (chunkIndex % pool.length) so each channel
 // is its own independent SCTP stream — parallel without head-of-line blocking.
 // No per-file channel setup overhead: pool is established at peer connect time.
-const XFER_POOL_SIZE = 4;
+const XFER_POOL_SIZE = 8;
 
 export class WebRTCMesh extends EventTarget {
   constructor(sendSignal, myPeerId) {
@@ -396,12 +396,12 @@ export class WebRTCMesh extends EventTarget {
         const budget = this._xferBufHigh.get(senderId);
         if (budget) {
           budget._bufHigh = BUF_MIN;        // start conservative (32 KB)
-          budget._bufMax  = 512 * 1024;     // cap growth at 512 KB for Android peers
+          budget._bufMax  = 4 * 1024 * 1024; // cap growth at 4 MB — matches desktop initialBufHigh(); adaptive tuning shrinks if the link can't sustain it
         }
         console.log(
           '[mesh] 📱 peer', senderId.slice(0, 8),
           '— Android detected, native WebRTC path active (NativeRtcBridge.kt)',
-          '| budget clamped to', BUF_MIN / 1024, 'KB (max 512 KB)',
+          '| budget clamped to', BUF_MIN / 1024, 'KB (max 4 MB)',
           '| total android peers:', this._androidPeers.size,
         );
       }
@@ -548,13 +548,13 @@ export class WebRTCMesh extends EventTarget {
             this._xferPool.set(peerId, pool);
 
             // Shared budget for responder pool — same as initiator side.
-            // Android peers get a conservative initial budget (BUF_MIN = 32 KB, capped
-            // at 512 KB) so the desktop doesn't blast 4 MB into Android's narrow SCTP
-            // receive window before any backpressure can kick in.
+            // Android peers get a conservative initial budget (BUF_MIN = 32 KB) so the
+            // desktop doesn't blast into Android's SCTP receive window before backpressure
+            // kicks in. Ceiling raised to 4 MB — adaptive tuning shrinks if the link can't sustain it.
             const isAndroid = this._androidPeers.has(peerId);
             const shared = {
               _bufHigh: isAndroid ? BUF_MIN : initialBufHigh(),
-              ...(isAndroid && { _bufMax: 512 * 1024 }),
+              ...(isAndroid && { _bufMax: 4 * 1024 * 1024 }), // 4 MB ceiling — adaptive tuning shrinks if link can't sustain it
             };
             this._xferBufHigh.set(peerId, shared);
             pool.forEach(dc => { dc._sharedBufHigh = shared; dc._peerId = peerId; });
