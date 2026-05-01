@@ -94,6 +94,13 @@ export class WebRTCMesh extends EventTarget {
     this._androidPeers    = new Set();
     /** @type {Set<string>} peers identified as Safari (via _safari flag in rtc_offer or rtc_answer) */
     this._safariPeers     = new Set();
+    // Per-peer promise that resolves once peer-type detection (Android/Safari flags) has run.
+    // getPoolChannels awaits this so the shared budget is always clamped before the first
+    // sendOnChannel call — closes the race where pool DCs open (ICE event) before the
+    // rtc_answer carrying _android:true is processed, causing the initiator to send at
+    // the default 4 MB budget before the retroactive clamp in handleSignal fires.
+    /** @type {Map<string, { resolve: () => void, promise: Promise<void> }>} */
+    this._peerTypeReady   = new Map();
     // Per-DC write queues — gives each pool channel an independent drain loop so
     // concurrent sendOnChannel calls on different DCs overlap instead of serialising.
     /** @type {WeakMap<RTCDataChannel, { pending: Array<{buffer:ArrayBuffer, resolve:()=>void}>, running:boolean }>} */
@@ -144,6 +151,16 @@ export class WebRTCMesh extends EventTarget {
     if (this.myPeerId > peerId) {
       const dc = pc.createDataChannel('files', { ordered: false });
       this._setupDC(peerId, dc);
+      // Create the peer-type gate before _openPool so getPoolChannels can await it.
+      // Resolved by handleSignal when rtc_answer arrives (Android/Safari flags read).
+      // This guarantees the shared budget is clamped to BUF_MIN for Android peers
+      // before any sendOnChannel call fires — closes the race where pool DCs open
+      // via ICE events before the answer is processed.
+      if (!this._peerTypeReady.has(peerId)) {
+        let res;
+        const promise = new Promise(r => { res = r; });
+        this._peerTypeReady.set(peerId, { resolve: res, promise });
+      }
       // Pre-open the transfer pool — all created before the offer so the
       // SDP carries all streams in one round-trip with no extra negotiation.
       this._openPool(peerId, pc);
@@ -180,6 +197,7 @@ export class WebRTCMesh extends EventTarget {
     this._xferBufHigh.delete(peerId);
     this._androidPeers.delete(peerId);
     this._safariPeers.delete(peerId);
+    this._peerTypeReady.delete(peerId);
     for (const [key, asm] of this._assemblers) {
       if (asm.peerId === peerId) this._assemblers.delete(key);
     }
@@ -398,6 +416,10 @@ export class WebRTCMesh extends EventTarget {
         );
       }
       if (pc && pc.signalingState === 'have-local-offer') {
+        // Peer type is now known — unblock getPoolChannels so the shared budget
+        // is already clamped before the first sendOnChannel call.
+        this._peerTypeReady.get(senderId)?.resolve();
+        this._peerTypeReady.delete(senderId);
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
           const buffered = this._icePending.get(senderId);
@@ -463,10 +485,17 @@ export class WebRTCMesh extends EventTarget {
   }
 
   // Returns a Promise<RTCDataChannel[]> that resolves once all XFER_POOL_SIZE
-  // pool DCs for `peerId` are open. Rejects after `timeoutMs` (default 10 s).
+  // pool DCs for `peerId` are open AND peer-type detection has completed.
+  // The peer-type gate (_peerTypeReady) ensures the shared budget is clamped for
+  // Android peers before the first sendOnChannel call — prevents the race where
+  // pool DCs open via ICE events before the rtc_answer carrying _android:true
+  // is processed, which would let the initiator send at the 4 MB default budget.
+  // Desktop peers: gate resolves in the same answer-processing microtask, zero cost.
   getPoolChannels(peerId, timeoutMs = 10_000) {
-    const pool = this._xferPool.get(peerId);
-    if (pool) return Promise.resolve(pool);
+    const pool      = this._xferPool.get(peerId);
+    const typeGate  = this._peerTypeReady.get(peerId)?.promise ?? Promise.resolve();
+
+    if (pool) return typeGate.then(() => pool);
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -476,7 +505,8 @@ export class WebRTCMesh extends EventTarget {
 
       this._xferPoolResolve.set(peerId, p => {
         clearTimeout(timer);
-        resolve(p);
+        // Wait for peer-type detection before handing the pool to the caller.
+        typeGate.then(() => resolve(p));
       });
 
       // Race guard: pool may have become ready between the get() check above
@@ -485,7 +515,7 @@ export class WebRTCMesh extends EventTarget {
       if (poolNow) {
         clearTimeout(timer);
         this._xferPoolResolve.delete(peerId);
-        resolve(poolNow);
+        typeGate.then(() => resolve(poolNow));
       }
     });
   }
