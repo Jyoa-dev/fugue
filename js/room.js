@@ -197,13 +197,9 @@ class StreamingDownloader {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-// Concurrent encrypt+send lanes.
-// Desktop → desktop: 32 lanes across the 4-worker pool (8 lanes/worker) keeps
-// every crypto worker and the pool DCs continuously saturated.
-// Desktop → Android: same 4-pool striped path as desktop-to-desktop now that
-// Kotlin's parseDCFrame strips the _sendOnDC 12-byte transport header.
-// 32 lanes keeps all crypto workers and all 4 pool DCs continuously saturated.
-const SEND_CONCURRENCY = 32;
+const SEND_CONCURRENCY_PER_DC = 4; // lanes per pool DC — tunes crypto/DC saturation
+// activeConcurrency = dcPool.length * SEND_CONCURRENCY_PER_DC at send time
+// Desktop → desktop (8 DCs): 32 lanes. Desktop → Android (8 DCs): 32 lanes.
 
 // Files we can show inline — use Blob URL path so preview works.
 // Everything else streams via SW (zero heap for large files).
@@ -888,7 +884,7 @@ export class Room {
     };
 
     // All peers now use the 4-pool striped path. Single concurrency value.
-    const activeConcurrency = SEND_CONCURRENCY;
+    const activeConcurrency = dcPool.length * SEND_CONCURRENCY_PER_DC;
     const lanes = new Array(activeConcurrency).fill(Promise.resolve());
     let lane = 0;
     let chunkCount = 0;
