@@ -200,11 +200,9 @@ class StreamingDownloader {
 // Concurrent encrypt+send lanes.
 // Desktop → desktop: 32 lanes across the 4-worker pool (8 lanes/worker) keeps
 // every crypto worker and the pool DCs continuously saturated.
-// Desktop → Android: sendDirect bypasses the pool (single shared DC, one
-// dc.send() per app frame). The original value of 16 was tuned for 4-lane pool
-// usage; with 64 KB chunks going over a single DC, raising to 32 lets more
-// crypto work overlap with DC drain time without measurably growing heap.
-// Cap: monitor Android heap with Android Studio — back off if GC pauses appear.
+// Desktop → Android: same 4-pool striped path as desktop-to-desktop now that
+// Kotlin's parseDCFrame strips the _sendOnDC 12-byte transport header.
+// 32 lanes keeps all crypto workers and all 4 pool DCs continuously saturated.
 const SEND_CONCURRENCY = 32;
 
 // Files we can show inline — use Blob URL path so preview works.
@@ -818,8 +816,6 @@ export class Room {
     // Pre-encode fileId bytes once (saves 16 parseInt calls per chunk).
     const fileIdBytes = uuidToBytes(fileId);
 
-    const ANDROID_CHUNK_CAP = 256 * 1024 - 54; // 262 090 bytes — matches DC_CHUNK in NativeRtcBridge.kt
-
     // ── LAN fast-path (files ≥ 5 MB, Android only) ───────────────────────
     // Attempt TCP over Wi-Fi Direct or LAN before falling through to WebRTC DC.
     // On Android, the bridge's patched sendOnChannel/getPoolChannels already
@@ -841,21 +837,13 @@ export class Room {
     const isAndroidPeer = this._rtc._androidPeers?.has(requesterId) === true;
     console.log('[sendChunks] isAndroidPeer:', isAndroidPeer, 'for', requesterId.slice(0, 8));
 
-    // ── Android chunk size cap ────────────────────────────────────────────
-    // For Android native peers we bypass _sendOnDC's transport wrapper entirely
-    // (sendDirect calls dc.send() once per app frame). NativeRtcBridge.kt sets
-    // DC_CHUNK = 256 KB so libwebrtc is configured to accept frames up to that
-    // size. Cap plaintext at 256 KB - 54 (26-byte DC header + 28-byte AES-GCM
-    // overhead) = 262 090 bytes so the framed message stays exactly at DC_CHUNK.
-    // Desktop-to-desktop transfers are unaffected: they use _sendOnDC which splits
-    // automatically and the receiver reassembles via _handleFrame.
-    const effectiveChunkSize = isAndroidPeer
-      ? Math.min(entry.chunkSize, ANDROID_CHUNK_CAP)
-      : entry.chunkSize;
+    // effectiveChunkSize: pool path uses _sendOnDC which auto-fragments, so
+    // no Android-specific cap is needed. Both peer types use the same chunk size.
+    const effectiveChunkSize = entry.chunkSize;
 
-    // Seed log — _setupAndroidDC initialises _bufHigh at BUF_MIN already.
+    // Seed log — both peer types use the pool path now.
     if (isAndroidPeer) {
-      console.log('[sendChunks] Android peer — sendDirect path for', requesterId.slice(0, 8));
+      console.log('[sendChunks] Android peer — pool path (4 DCs) for', requesterId.slice(0, 8));
     }
 
     const sendOne = async (chunk) => {
@@ -887,11 +875,11 @@ export class Room {
       }
 
       if (isAndroidPeer) {
-        // sendDirect: raw dc.send() with no _sendOnDC transport wrapper.
-        // _sendOnDC adds its own 12-byte fragmentation header which Kotlin's
-        // parseDCFrame() does not understand — frames must arrive as-is with
-        // only the 26-byte room.js header at offset 0.
-        await this._rtc.sendDirect(requesterId, frame);
+        // Pool path: same as desktop. Kotlin's parseDCFrame now strips the
+        // 12-byte _sendOnDC transport header, so the 4-pool striped path works
+        // for Android peers. HOL blocking and the 512 KB buffer ceiling are gone.
+        const dc = dcPool[chunk.index % dcPool.length];
+        await this._rtc.sendOnChannel(dc, frame);
         return;
       }
 
@@ -899,12 +887,8 @@ export class Room {
       await this._rtc.sendOnChannel(dc, frame);
     };
 
-    // Android single DC: 8 lanes — crypto workers are shared but the single
-    // ordered DC is the bottleneck, not parallelism. More lanes just pile up
-    // in the write queue without benefit.
-    // Desktop pool (4 DCs): 32 lanes — 8 per channel keeps every crypto worker
-    // and each pool DC continuously saturated.
-    const activeConcurrency = isAndroidPeer ? 8 : SEND_CONCURRENCY;
+    // All peers now use the 4-pool striped path. Single concurrency value.
+    const activeConcurrency = SEND_CONCURRENCY;
     const lanes = new Array(activeConcurrency).fill(Promise.resolve());
     let lane = 0;
     let chunkCount = 0;
