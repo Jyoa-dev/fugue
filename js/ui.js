@@ -214,7 +214,10 @@ export const UI = (() => {
           <div class="file-bubble-icon">${fileIcon(msg.name)}</div>
           <div class="file-bubble-info">
             <div class="file-bubble-name">${escapeHtml(msg.name)}</div>
-            <div class="file-bubble-meta">${fmtSize(msg.size)}</div>
+            <div class="file-bubble-meta">
+              ${fmtSize(msg.size)}
+              <span id="bubble-spd-${msg.fileId}" class="dl-speed" style="margin-left:6px;opacity:0.7;"></span>
+            </div>
             <div class="progress-wrap hidden" id="progwrap-${msg.fileId}">
               <div class="progress-bar" id="prog-${msg.fileId}">
                 <div class="progress-fill" style="width:0%"></div>
@@ -296,6 +299,7 @@ export const UI = (() => {
         if (wrap) wrap.classList.add('hidden');
       }
     }
+    // Chat bubble speed
     // File panel entry
     const entryProg = $(`entry-prog-${fileId}`);
     const entryPct  = $(`entry-pct-${fileId}`);
@@ -577,6 +581,12 @@ export const UI = (() => {
     const wrap   = $(`progwrap-${fileId}`);
     const action = $(`bubble-action-${fileId}`);
     if (!action) return;
+
+    // Speed in conv bubble — mirrors how renderFilePanel reads f.speed directly
+    const bubbleSpd = $(`bubble-spd-${fileId}`);
+    if (bubbleSpd) {
+      bubbleSpd.textContent = (status === 'downloading' && f.speed) ? fmtSpeed(f.speed) : '';
+    }
 
     if (status === 'done') {
       if (wrap) wrap.classList.add('hidden');

@@ -465,23 +465,27 @@ export class WebRTCMesh extends EventTarget {
     const shared = { _bufHigh: initialBufHigh() };
     this._xferBufHigh.set(peerId, shared);
 
-    const onOpen = () => {
+    console.log('[pool] _openPool START for', peerId.slice(0,8), '| target size:', XFER_POOL_SIZE);
+    const onOpen = (label) => {
+      console.log('[pool] initiator DC open:', label, '| openCount now', openCount + 1, '/', XFER_POOL_SIZE, '| peer', peerId.slice(0,8));
       if (++openCount < XFER_POOL_SIZE) return;
-      console.log('[pool] initiator pool ready for', peerId.slice(0,8));
+      console.log('[pool] initiator pool READY for', peerId.slice(0,8));
       this._xferPool.set(peerId, dcs);
       this._xferPoolResolve.get(peerId)?.(dcs);
       this._xferPoolResolve.delete(peerId);
     };
     for (let i = 0; i < XFER_POOL_SIZE; i++) {
-      const dc = pc.createDataChannel(`xferp-${i}`, { ordered: false }); // ordered:false — no SCTP HOL blocking
+      const dc = pc.createDataChannel(`xferp-${i}`, { ordered: false });
+      console.log('[pool] createDataChannel xferp-' + i, '| readyState:', dc.readyState, '| peer', peerId.slice(0,8));
       dc.binaryType     = 'arraybuffer';
       dc._peerId        = peerId;
-      dc._sharedBufHigh = shared; // point at shared object, not a per-DC value
-      dc.onopen     = onOpen;
+      dc._sharedBufHigh = shared;
+      dc.onopen     = () => onOpen(dc.label);
       dc.onmessage  = ({ data }) => this._handleFrame(peerId, data);
-      dc.onerror    = e => console.warn('pool DC error', peerId, dc.label, e);
+      dc.onerror    = e => console.warn('[pool] DC error', dc.label, peerId, e);
       dcs.push(dc);
     }
+    console.log('[pool] _openPool END — created', dcs.length, 'DCs for', peerId.slice(0,8));
   }
 
   // Returns a Promise<RTCDataChannel[]> that resolves once all XFER_POOL_SIZE
@@ -764,7 +768,7 @@ export class WebRTCMesh extends EventTarget {
         }
         if (cur >= lastBuffered) {
           stalledTicks++;
-          if (stalledTicks >= 60) { // 60 × 50 ms = 3000 ms with no progress
+          if (stalledTicks >= 20) { // 20 × 50 ms = 1000 ms with no progress
             console.warn('[drain] SCTP stall on', dc.label,
               '| buffered:', cur, 'B unchanged for 3000 ms — force-resolving');
             forceResolved = true;

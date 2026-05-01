@@ -696,7 +696,7 @@ export class Room {
   // App chunks larger than DC_CHUNK (webrtc.js) are transparently split into
   // multiple DC frames by _sendOnDC, so there is no hard upper-bound here.
   // Tiers are tuned so async overhead per GB drops as file size grows.
-  _computeChunkSize(fileSize) {
+/*   _computeChunkSize(fileSize) {
     const KB = 1024, MB = 1024 * KB;
     let base;
     if      (fileSize <  512 * KB) base = Math.max(32  * KB, Math.ceil(fileSize / 4));
@@ -704,7 +704,18 @@ export class Room {
     else if (fileSize <  256 * MB) base = 512 * KB;
     else                           base =   1 * MB;
     return base;
-  }
+  } */
+
+    _computeChunkSize(fileSize) {
+      const KB = 1024, MB = 1024 * KB;
+      // Cap at DC_CHUNK_DESKTOP (256 KB − 12 B header) so _sendOnDC always sends
+      // total === 1 fragment — no FragmentAssembler on either side.
+      const ENCRYPTION_OVERHEAD = this._crypto ? 28 : 0;
+      const DC_CAP = 256 * KB - 12 - ENCRYPTION_OVERHEAD;
+
+      if (fileSize < 512 * KB) return Math.max(32 * KB, Math.ceil(fileSize / 4));
+      return DC_CAP;
+    }
 
   // ── LAN transport helpers ─────────────────────────────────────────────────
 
