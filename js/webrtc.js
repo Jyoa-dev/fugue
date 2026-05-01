@@ -45,6 +45,18 @@ const _isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
 const BUF_MIN = 32   * 1024;        //  32 KB floor — conservative for Android SCTP
 const BUF_MAX =  16  * 1024 * 1024; //   16 MB ceiling
 
+// Android send-side association cap.
+// libwebrtc Android has ONE shared SCTP send window per PeerConnection — all pool DCs
+// compete for it. Allowing N × DC_CHUNK_DESKTOP in-flight simultaneously saturates the
+// window instantly (8 × 256 KB = 2 MB >> ~256–512 KB window) so every channel stalls
+// in lockstep. This cap gates total bufferedAmount across all pool DCs to one frame,
+// ensuring the window can drain before the next frame enters any channel.
+// Android chunk size is pre-computed in room.js _computeChunkSize() to land exactly in
+// one DC_CHUNK_DESKTOP dc.send() after all overhead (app header + transport header +
+// crypto), so "one frame" == one dc.send() == DC_CHUNK_DESKTOP bytes on the wire.
+const ANDROID_INFLIGHT_CAP = DC_CHUNK_DESKTOP; // one 256 KB frame total across all pool DCs
+const ANDROID_BUF_MAX      = 2 * DC_CHUNK_DESKTOP; // 512 KB — per-channel budget ceiling for Android
+
 function initialBufHigh() {
   const c = navigator.connection || navigator.mozConnection;
   if (c) {
@@ -392,16 +404,18 @@ export class WebRTCMesh extends EventTarget {
         this._androidPeers.add(senderId);
         // _openPool() ran before this answer arrived and used initialBufHigh() = 4 MB.
         // Retroactively clamp the shared budget so the first sendOnChannel call
-        // doesn't blast 4 MB into Android's SCTP receive window.
+        // doesn't blast into Android's shared SCTP send window.
         const budget = this._xferBufHigh.get(senderId);
         if (budget) {
-          budget._bufHigh = BUF_MIN;        // start conservative (32 KB)
-          budget._bufMax  = 4 * 1024 * 1024; // cap growth at 4 MB — matches desktop initialBufHigh(); adaptive tuning shrinks if the link can't sustain it
+          budget._bufHigh            = BUF_MIN;            // start conservative (32 KB)
+          budget._bufMax             = ANDROID_BUF_MAX;    // cap at 512 KB — prevents re-saturation
+          budget._androidInFlightCap = ANDROID_INFLIGHT_CAP; // association-level gate across all pool DCs
         }
         console.log(
           '[mesh] 📱 peer', senderId.slice(0, 8),
           '— Android detected, native WebRTC path active (NativeRtcBridge.kt)',
-          '| budget clamped to', BUF_MIN / 1024, 'KB (max 4 MB)',
+          '| budget clamped to', BUF_MIN / 1024, 'KB (max', ANDROID_BUF_MAX / 1024, 'KB)',
+          '| inflight cap', ANDROID_INFLIGHT_CAP / 1024, 'KB',
           '| total android peers:', this._androidPeers.size,
         );
       }
@@ -462,6 +476,9 @@ export class WebRTCMesh extends EventTarget {
     // read (dc._sharedBufHigh ?? dc)._bufHigh, so a mismatched key silently
     // returned undefined and fell back to BUF_MIN (32 KB) for every pool send,
     // causing immediate back-pressure stalls and transfer_cancel on desktop peers.
+    // Android peers: _bufMax is capped at ANDROID_BUF_MAX (512 KB) so the adaptive
+    // tuner can't ramp back up to 4 MB and re-saturate the shared SCTP send window.
+    // _androidInFlightCap enforces a total across ALL pool DCs — see _sendOnDC.
     const shared = { _bufHigh: initialBufHigh() };
     this._xferBufHigh.set(peerId, shared);
 
@@ -553,12 +570,18 @@ export class WebRTCMesh extends EventTarget {
 
             // Shared budget for responder pool — same as initiator side.
             // Android peers get a conservative initial budget (BUF_MIN = 32 KB) so the
-            // desktop doesn't blast into Android's SCTP receive window before backpressure
-            // kicks in. Ceiling raised to 4 MB — adaptive tuning shrinks if the link can't sustain it.
+            // desktop doesn't blast into Android's SCTP send window before backpressure
+            // kicks in. _bufMax is capped at ANDROID_BUF_MAX (512 KB) — prevents the
+            // adaptive tuner from ramping back to 4 MB and re-saturating the shared
+            // SCTP send window. _androidInFlightCap gates total in-flight across all
+            // pool DCs at the association level — see _sendOnDC for enforcement.
             const isAndroid = this._androidPeers.has(peerId);
             const shared = {
               _bufHigh: isAndroid ? BUF_MIN : initialBufHigh(),
-              ...(isAndroid && { _bufMax: 4 * 1024 * 1024 }), // 4 MB ceiling — adaptive tuning shrinks if link can't sustain it
+              ...(isAndroid && {
+                _bufMax:             ANDROID_BUF_MAX,
+                _androidInFlightCap: ANDROID_INFLIGHT_CAP,
+              }),
             };
             this._xferBufHigh.set(peerId, shared);
             pool.forEach(dc => { dc._sharedBufHigh = shared; dc._peerId = peerId; });
@@ -668,13 +691,12 @@ export class WebRTCMesh extends EventTarget {
   }
 
   // Returns the per-call dc.send() ceiling for the given peer:
-  //   Safari (local browser or remote peer) → 64 KB, desktop/Android → 256 KB.
-  // dc._peerId is stamped in _setupDC and _openPool so every DC carries its peer.
-  // Two independent Safari checks apply:
-  //   _isSafari        — THIS browser is Safari, so all dc.send() calls are capped.
-  //   _safariPeers     — the REMOTE peer is Safari; their SCTP stack can't reassemble
-  //                      frames > 64 KB, so we must cap even from a desktop sender.
-  // Android peers use the desktop ceiling — NativeRtcBridge handles reassembly.
+  //   Safari (local or remote) → 64 KB (WebKit hard cap)
+  //   All others               → 256 KB
+  // Android peers use the desktop ceiling — room.js _computeChunkSize() pre-sizes
+  // the encrypted app chunk to fit in exactly one DC_CHUNK_DESKTOP dc.send() after
+  // all overhead (app header + transport header + crypto), so fragmentation never
+  // occurs in practice. DC_CHUNK_SAFARI here would re-introduce 4–5× fragmentation.
   _chunkSizeFor(peerId) {
     if (_isSafari || (peerId && this._safariPeers.has(peerId))) return DC_CHUNK_SAFARI;
     return DC_CHUNK_DESKTOP;
@@ -696,28 +718,83 @@ export class WebRTCMesh extends EventTarget {
       view.setUint32(8, i,          true);
       // Direct copy from source — skips the intermediate slice() allocation + copy.
       new Uint8Array(frame, 12).set(new Uint8Array(bytes, offset, chunkBytes));
-      // Use shared budget if this is a pool channel, else fall back to per-DC _bufHigh.
-      const high = (dc._sharedBufHigh ?? dc)._bufHigh ?? BUF_MIN;
-      if (dc.bufferedAmount > high) {
-        const stalled = await this._drainBuffer(dc);
-        // If the drain was force-resolved (SCTP stall / hang / DC closed mid-drain)
-        // abort this entire frame sequence now. Continuing to send into a pipe that
-        // isn't draining just re-enters _drainBuffer on the very next frame, creating
-        // a tight thrash loop: force-resolve → send → stall → force-resolve → …
-        // Let _runDCQueue handle the abort (it will flush pending callers cleanly).
-        if (stalled) {
-          console.warn('[send] aborting', dc.label,
-            '— stall/hang during drain, buffered =',
-            (dc.bufferedAmount / 1024).toFixed(0), 'KB');
-          return false;
+
+      const budget = dc._sharedBufHigh;
+
+      if (budget?._androidInFlightCap != null) {
+        // ── Android: serialise sends through a promise-chain mutex ──────────
+        // libwebrtc Android has ONE shared SCTP send window across all pool DCs.
+        // A check-then-send approach is inherently racy: all 8 _runDCQueue loops
+        // run concurrently, read totalInflight ≈ 0, pass the check, and each
+        // calls dc.send() before any of them sees the others' frames — producing
+        // 8 × 256 KB = 2 MB in-flight simultaneously and saturating the window.
+        //
+        // Solution: a promise-chain mutex on the shared budget object. Each send
+        // chains onto the previous one via budget._sendLock. The lock promise
+        // resolves only after _drainBuffer confirms the previous frame has left
+        // the SCTP send buffer, so sends are strictly serialised at the
+        // association level regardless of which pool DC they land on.
+        const releaseLock = await this._acquireAndroidSendLock(budget, dc);
+        if (!releaseLock) return false; // DC closed or stalled while waiting
+        if (dc.readyState !== 'open') { releaseLock(); return false; }
+        this._xferDiag.bytesSent += frame.byteLength;
+        dc.send(frame);
+        // Drain asynchronously then release the lock so the next queued send
+        // can proceed. We do NOT await here — that would block this channel's
+        // _runDCQueue while other channels sit idle. The lock serialises the
+        // sends; the drain happens in the background and releases when done.
+        this._drainAndRelease(dc, budget, releaseLock);
+      } else {
+        // ── Desktop: per-channel _bufHigh watermark ─────────────────────────
+        const high = (budget ?? dc)._bufHigh ?? BUF_MIN;
+        if (dc.bufferedAmount > high) {
+          const stalled = await this._drainBuffer(dc);
+          // If the drain was force-resolved (SCTP stall / hang / DC closed mid-drain)
+          // abort this entire frame sequence now. Continuing to send into a pipe that
+          // isn't draining just re-enters _drainBuffer on the very next frame, creating
+          // a tight thrash loop: force-resolve → send → stall → force-resolve → …
+          if (stalled) {
+            console.warn('[send] aborting', dc.label,
+              '— stall/hang during drain, buffered =',
+              (dc.bufferedAmount / 1024).toFixed(0), 'KB');
+            return false;
+          }
         }
+        if (dc.readyState !== 'open') return false;
+        this._xferDiag.bytesSent += frame.byteLength;
+        dc.send(frame);
       }
-      // If drain force-resolved due to a stall (SCTP flow-control), we already
-      // returned false above. The only remaining early-exit is DC closure.
-      if (dc.readyState !== 'open') return false;
-      this._xferDiag.bytesSent += frame.byteLength;
-      dc.send(frame);
     }
+  }
+
+  // Acquire the Android association-level send mutex.
+  // Returns a release function to call after the frame has drained, or null if
+  // the DC closed / stalled while we were waiting for the previous lock to clear.
+  async _acquireAndroidSendLock(budget, dc) {
+    // Chain onto whatever is currently holding the lock.
+    let release;
+    const myTurn = new Promise(r => { release = r; });
+    const prev   = budget._sendLock ?? Promise.resolve();
+    budget._sendLock = myTurn; // next caller will wait on myTurn
+    // Wait for the previous sender to finish draining.
+    let prevStalled = false;
+    await prev.catch(() => { prevStalled = true; });
+    if (prevStalled || dc.readyState !== 'open') {
+      release(); // unblock anyone waiting behind us
+      return null;
+    }
+    return release;
+  }
+
+  // Called after dc.send() on an Android pool channel.
+  // Waits for _drainBuffer, then calls release() to unblock the next sender.
+  async _drainAndRelease(dc, budget, release) {
+    const stalled = await this._drainBuffer(dc);
+    if (stalled) {
+      console.warn('[send] Android drain stalled on', dc.label,
+        '| buffered =', (dc.bufferedAmount / 1024).toFixed(0), 'KB');
+    }
+    release();
   }
 
   // Called only when bufferedAmount exceeded the threshold. Waits for drain,
@@ -802,10 +879,12 @@ export class WebRTCMesh extends EventTarget {
     console.debug(`[drain] exit ${dc.label} | ${Math.round(elapsed)} ms | ~${kbps} kbps | buffered=${(dc.bufferedAmount/1024).toFixed(0)}KB | concurrent=${d.concurrentDrains} | bufHigh=${((budget._bufHigh??BUF_MIN)/1024).toFixed(0)}KB`);
     // Write adaptation result back to shared budget so all pool channels on this
     // peer converge together rather than each channel tuning independently.
+    // Android: grow ×1.25 instead of ×2 — the shared SCTP send window is small
+    // (~256–512 KB) so aggressive doubling shoots past it in 1–2 cycles and
+    // re-saturates it immediately. Slow growth lets the window signal its own limit.
+    const growFactor = budget._androidInFlightCap != null ? 1.25 : 2;
     if (elapsed < 20 && budget._bufHigh < (budget._bufMax ?? BUF_MAX)) {
-      // Fast drain → link has headroom, grow aggressively (×2) so we reach
-      // the ceiling in ~2 cycles from the 4 MB start rather than crawling up.
-      budget._bufHigh = Math.min(budget._bufMax ?? BUF_MAX, (budget._bufHigh * 2) | 0);
+      budget._bufHigh = Math.min(budget._bufMax ?? BUF_MAX, Math.ceil(budget._bufHigh * growFactor));
     } else if (elapsed > 300 && budget._bufHigh > BUF_MIN) {
       // Very slow → shrink aggressively to converge quickly
       budget._bufHigh = Math.max(BUF_MIN, (budget._bufHigh * 0.5) | 0);

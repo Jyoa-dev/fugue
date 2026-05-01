@@ -696,7 +696,7 @@ export class Room {
   // App chunks larger than DC_CHUNK (webrtc.js) are transparently split into
   // multiple DC frames by _sendOnDC, so there is no hard upper-bound here.
   // Tiers are tuned so async overhead per GB drops as file size grows.
-/*   _computeChunkSize(fileSize) {
+/*    _computeChunkSize(fileSize) {
     const KB = 1024, MB = 1024 * KB;
     let base;
     if      (fileSize <  512 * KB) base = Math.max(32  * KB, Math.ceil(fileSize / 4));
@@ -704,18 +704,92 @@ export class Room {
     else if (fileSize <  256 * MB) base = 512 * KB;
     else                           base =   1 * MB;
     return base;
-  } */
+  } 
+ */
+/* _computeChunkSize(fileSize) {
+  const KB = 1024, MB = 1024 * KB;
+  // Cap at DC_CHUNK_DESKTOP (256 KB − 12 B header) so _sendOnDC always sends
+  // total === 1 fragment — no FragmentAssembler on either side.
+  const DC_CAP = 256 * KB - 12;
+  if (fileSize < 512 * KB) return Math.max(32 * KB, Math.ceil(fileSize / 4));
+  return DC_CAP;
+} */
 
-    _computeChunkSize(fileSize) {
-      const KB = 1024, MB = 1024 * KB;
-      // Cap at DC_CHUNK_DESKTOP (256 KB − 12 B header) so _sendOnDC always sends
-      // total === 1 fragment — no FragmentAssembler on either side.
-      const ENCRYPTION_OVERHEAD = this._crypto ? 28 : 0;
-      const DC_CAP = 256 * KB - 12 - ENCRYPTION_OVERHEAD;
+/* _computeChunkSize(fileSize) {
+  const KB = 1024, MB = 1024 * KB;
+  // Cap at DC_CHUNK_DESKTOP (256 KB − 12 B header) so _sendOnDC always sends
+  // total === 1 fragment — no FragmentAssembler on either side.
+  const ENCRYPTION_OVERHEAD = this._crypto ? 28 : 0;
+  const DC_CAP = 256 * KB - 12 - ENCRYPTION_OVERHEAD;
 
-      if (fileSize < 512 * KB) return Math.max(32 * KB, Math.ceil(fileSize / 4));
-      return DC_CAP;
+  if (fileSize < 512 * KB) return Math.max(32 * KB, Math.ceil(fileSize / 4));
+  return DC_CAP;
+} */
+
+/*   _computeChunkSize(fileSize) {
+    const KB = 1024, MB = 1024 * KB;
+  
+    // DC_CHUNK_DESKTOP = 256 KB − 12 B transport header = 262132 B.
+    // Encrypted app-chunk must fit within that after cipher overhead is added,
+    // so _sendOnDC always produces total===1 — no FragmentAssembler on either side.
+    //
+    // Overhead = IV + auth tag prepended by crypto.js encrypt():
+    //   AES-256/192-GCM     12 IV + 16 tag = 28 B
+    //   AES-256-CBC         16 IV + 0  tag = 16 B  (no AEAD tag)
+    //   ChaCha20-Poly1305   12 IV + 16 tag = 28 B
+    //   XChaCha20-Poly1305  24 IV + 16 tag = 40 B  ← worst case
+    //
+    // We use the actual cipher's overhead rather than a fixed worst-case so
+    // GCM/ChaCha users aren't penalised 12 extra bytes for XChaCha's nonce.
+    let cryptoOverhead = 0;
+    if (this._crypto) {
+      const cipher = this.settings?.cipher || 'AES-256-GCM';
+      if      (cipher === 'XChaCha20-Poly1305') cryptoOverhead = 40;
+      else if (cipher === 'AES-256-CBC')        cryptoOverhead = 16;
+      else                                      cryptoOverhead = 28; // GCM, ChaCha20
     }
+  
+    const DC_CAP = 256 * KB - 12 - cryptoOverhead;
+  
+    if (fileSize < 512 * KB) return Math.max(32 * KB, Math.ceil(fileSize / 4));
+    return DC_CAP;
+  }
+ */
+
+
+
+  _computeChunkSize(fileSize, isAndroidPeer = false) {
+    const KB = 1024, MB = 1024 * KB;
+  
+    if (fileSize < 512 * KB) return Math.max(32 * KB, Math.ceil(fileSize / 4));
+  
+    if (isAndroidPeer) {
+      let cryptoOverhead = 0;
+      if (this._crypto) {
+        const cipher = this.settings?.cipher || 'AES-256-GCM';
+        if      (cipher === 'XChaCha20-Poly1305') cryptoOverhead = 40;
+        else if (cipher === 'AES-256-CBC')        cryptoOverhead = 16;
+        else                                      cryptoOverhead = 28;
+      }
+      // 26 = CHUNK_HDR (app frame header)
+      // 12 = _sendOnDC transport header
+      // cryptoOverhead = IV + tag added by encrypt()
+      // Total must fit in DC_CHUNK (256 KB) after all three are added
+      return 256 * KB - 26 - 12 - cryptoOverhead;
+    }
+  
+    // Desktop: unchanged
+    if (fileSize <  32 * MB) return 256 * KB;
+    if (fileSize < 256 * MB) return 512 * KB;
+    return 1 * MB;
+  }
+
+
+
+
+
+
+
 
   // ── LAN transport helpers ─────────────────────────────────────────────────
 
@@ -846,7 +920,7 @@ export class Room {
 
     // effectiveChunkSize: pool path uses _sendOnDC which auto-fragments, so
     // no Android-specific cap is needed. Both peer types use the same chunk size.
-    const effectiveChunkSize = entry.chunkSize;
+    const effectiveChunkSize = this._computeChunkSize(entry.file.size, isAndroidPeer);
 
     // Seed log — both peer types use the pool path now.
     if (isAndroidPeer) {
