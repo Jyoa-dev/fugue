@@ -19,10 +19,10 @@ const ICE_SERVERS = [
 //   Chrome/Firefox  → 256 KB (libwebrtc kMaxSctpMessageSize = 262144 B;
 //                             262144 − 12 = 262132 B payload ceiling)
 //
-// Android peers never reach _sendOnDC — they use sendDirect (shared DC, raw
-// dc.send() with no transport wrapper) or NativeBlob.sendChunk() (Kotlin fast
-// path). The 256 KB app-chunk cap for Android is enforced in room.js
-// (_sendChunks ANDROID_CHUNK_CAP) against NativeRtcBridge.kt's DC_CHUNK.
+// Android peers now use sendOnChannel through the 4-pool path (same as desktop)
+// after NativeRtcBridge.kt gained transport-header stripping in parseDCFrame.
+// The 256 KB app-chunk cap (ANDROID_CHUNK_CAP) in room.js is also removed —
+// _sendOnDC fragments automatically so any chunk size is safe.
 //
 // _sendOnDC reads _chunkSizeFor(peerId) at call time so the right size is used
 // per-peer. Small messages (chat etc.) still hit the total===1 fast-path with
@@ -44,10 +44,6 @@ const _isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
 // sender wakes up while there is still room in the pipe — no idle stall.
 const BUF_MIN = 32   * 1024;        //  32 KB floor — conservative for Android SCTP
 const BUF_MAX =  16  * 1024 * 1024; //   16 MB ceiling
-// Tighter ceiling for the single ordered android-direct DC. The pool adaptation
-// can reach 16 MB safely across 4 parallel streams; a single ordered channel
-// accumulates SCTP debt instead — cap at 512 KB (~2 chunks) to keep latency low.
-const BUF_MAX_ANDROID = 512 * 1024; // 512 KB ceiling for android-direct DC
 
 function initialBufHigh() {
   const c = navigator.connection || navigator.mozConnection;
@@ -79,7 +75,7 @@ export class WebRTCMesh extends EventTarget {
     /** @type {Map<string, RTCDataChannel>} */
     this._dcs          = new Map(); // shared 'files' DC per peer (chat + signaling)
     /** @type {Map<string, RTCDataChannel>} */
-    this._androidDcs   = new Map(); // ordered DC per peer — sendDirect (Android large frames)
+    this._androidDcs   = new Map(); // ordered 'android-direct' DC per peer (chat fallback; file transfers use pool)
     /** @type {Map<string, Array<()=>void>>} */
     this._dcReady      = new Map();
     /** @type {Map<string, { total:number, frags:ArrayBuffer[], received:number, peerId:string }>} */
@@ -578,13 +574,13 @@ export class WebRTCMesh extends EventTarget {
   }
 
   // Ordered DC for Android direct sends (label 'android-direct', ordered:true).
-  // Kept separate from _dcs so chat/signaling on 'files' remains unordered.
-  // No peer_ready dispatch — _setupDC fires that when 'files' opens (always first).
+  // Kept for legacy compatibility — new transfers use the 4-pool path via
+  // sendOnChannel. sendDirect still falls back here for chat/small frames.
+  // No _bufMax cap — the android-direct DC is no longer the file transfer path.
   _setupAndroidDC(peerId, dc) {
     this._androidDcs.set(peerId, dc);
     dc.binaryType = 'arraybuffer';
-    dc._bufHigh   = BUF_MIN;         // start low — adaptation grows from here
-    dc._bufMax    = BUF_MAX_ANDROID; // cap adaptation at 512 KB (single ordered DC)
+    dc._bufHigh   = initialBufHigh();
     dc._peerId    = peerId;
     dc.onclose = () => { this._androidDcs.delete(peerId); };
     dc.onerror = e => {
@@ -623,13 +619,13 @@ export class WebRTCMesh extends EventTarget {
   }
 
   // Returns the per-call dc.send() ceiling for the given peer:
-  //   Safari (local browser or remote peer) → 64 KB, desktop → 256 KB.
-  // Android peers never reach this — they use sendDirect / NativeBlob.sendChunk().
+  //   Safari (local browser or remote peer) → 64 KB, desktop/Android → 256 KB.
   // dc._peerId is stamped in _setupDC and _openPool so every DC carries its peer.
   // Two independent Safari checks apply:
   //   _isSafari        — THIS browser is Safari, so all dc.send() calls are capped.
   //   _safariPeers     — the REMOTE peer is Safari; their SCTP stack can't reassemble
   //                      frames > 64 KB, so we must cap even from a desktop sender.
+  // Android peers use the desktop ceiling — NativeRtcBridge handles reassembly.
   _chunkSizeFor(peerId) {
     if (_isSafari || (peerId && this._safariPeers.has(peerId))) return DC_CHUNK_SAFARI;
     return DC_CHUNK_DESKTOP;
