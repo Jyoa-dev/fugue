@@ -372,9 +372,18 @@ export class WebRTCMesh extends EventTarget {
       // is using native Android WebRTC (NativeRtcBridge.kt), not the browser stack.
       if (msg._android && !this._androidPeers.has(senderId)) {
         this._androidPeers.add(senderId);
+        // _openPool() ran before this answer arrived and used initialBufHigh() = 4 MB.
+        // Retroactively clamp the shared budget so the first sendOnChannel call
+        // doesn't blast 4 MB into Android's SCTP receive window.
+        const budget = this._xferBufHigh.get(senderId);
+        if (budget) {
+          budget._bufHigh = BUF_MIN;        // start conservative (32 KB)
+          budget._bufMax  = 512 * 1024;     // cap growth at 512 KB for Android peers
+        }
         console.log(
           '[mesh] 📱 peer', senderId.slice(0, 8),
           '— Android detected, native WebRTC path active (NativeRtcBridge.kt)',
+          '| budget clamped to', BUF_MIN / 1024, 'KB (max 512 KB)',
           '| total android peers:', this._androidPeers.size,
         );
       }
@@ -509,8 +518,14 @@ export class WebRTCMesh extends EventTarget {
             this._xferPool.set(peerId, pool);
 
             // Shared budget for responder pool — same as initiator side.
-            // FIX: key must be _bufHigh — see matching fix in _openPool above.
-            const shared = { _bufHigh: initialBufHigh() };
+            // Android peers get a conservative initial budget (BUF_MIN = 32 KB, capped
+            // at 512 KB) so the desktop doesn't blast 4 MB into Android's narrow SCTP
+            // receive window before any backpressure can kick in.
+            const isAndroid = this._androidPeers.has(peerId);
+            const shared = {
+              _bufHigh: isAndroid ? BUF_MIN : initialBufHigh(),
+              ...(isAndroid && { _bufMax: 512 * 1024 }),
+            };
             this._xferBufHigh.set(peerId, shared);
             pool.forEach(dc => { dc._sharedBufHigh = shared; dc._peerId = peerId; });
 
