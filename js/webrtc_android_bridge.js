@@ -177,15 +177,29 @@ export function initAndroidBridge(WebRTCMesh) {
   };
 
   // ── sendBinary (shared DC) ────────────────────────────────────────────────
-  // JS → Kotlin: encode frame as base64, call @JavascriptInterface sendShared.
-  // Kotlin handles DC fragmentation via splitFrame().
+  // JS → Kotlin: wrap frame with _sendOnDC transport header (total=1) then
+  // encode as base64 and call @JavascriptInterface sendShared.
+  //
+  // WHY the transport header is required here:
+  //   webrtc.js sendBinary() calls _sendOnDC() which ALWAYS prepends a 12-byte
+  //   transport header [transferId(u32 LE) | total(u32 LE) | index(u32 LE)].
+  //   Desktop's _handleFrame() unconditionally strips those 12 bytes, so any
+  //   frame arriving on the shared DC from Android MUST carry that header or
+  //   _handleFrame() will consume the first 12 payload bytes as header fields,
+  //   producing a garbled transferId, a nonsensical total, and a dropped message.
+  //
+  //   Symmetrically, Kotlin's handleInboundFrame() strips the header for ALL
+  //   DataChannels (shared and pool alike) so outbound messages from the desktop
+  //   — which always carry the header via _sendOnDC — are forwarded to JS
+  //   as clean app frames with no header bytes prepended.
   const _origSendBinary = proto.sendBinary;
   proto.sendBinary = async function(peerId, buffer) {
     const pc = this._pcs.get(peerId);
     if (!pc?._native) return _origSendBinary.call(this, peerId, buffer);
     _dbg('sendBinary (native shared DC)', peerId.slice(0,8));
-    const bytes = buffer instanceof ArrayBuffer ? buffer : buffer.buffer;
-    const ok = window.AndroidRtc.sendShared(peerId, _toB64(bytes));
+    const bytes   = buffer instanceof ArrayBuffer ? buffer : buffer.buffer;
+    const wrapped = _wrapSingleFragment(bytes);
+    const ok = window.AndroidRtc.sendShared(peerId, _toB64(wrapped));
     if (!ok) throw new Error(`[android-bridge] sendShared failed for ${peerId.slice(0,8)}`);
   };
 
@@ -316,6 +330,10 @@ export function initAndroidBridge(WebRTCMesh) {
   // Inbound non-chunk frames (chat, lan_caps) forwarded from Kotlin.
   // Uses _activeMesh (captured in _nativeRtcReady) rather than window._webrtcMesh
   // so reconnects that replace the mesh object don't break the dispatch target.
+  //
+  // Kotlin strips the _sendOnDC transport header before forwarding (see
+  // handleInboundFrame in NativeRtcBridge.kt), so `b64` here decodes to a
+  // clean app frame starting at byte 0 — ready for room.js decodeDCFrame().
   window._nativeBinary = (peerId, b64) => {
     const mesh = _activeMesh || window._webrtcMesh;
     if (!mesh) { _warn('_nativeBinary — no mesh'); return; }
@@ -411,8 +429,26 @@ export function initAndroidBridge(WebRTCMesh) {
     return _fromB64(b64);
   }
 
-  // ── Frame helpers (outbound only) ─────────────────────────────────────────
-  // No fragmentation here — Kotlin's sendBytes() calls splitFrame() natively.
+  // ── Frame helpers ─────────────────────────────────────────────────────────
+
+  /**
+   * Wrap [bytes] with the _sendOnDC transport header for a single-fragment
+   * (total=1) message.  All outbound shared-DC frames must carry this header
+   * so the desktop peer's _handleFrame() can strip it identically to the frames
+   * it sends itself via _sendOnDC.
+   *
+   * Layout (mirrors _sendOnDC in webrtc.js):
+   *   [transferId(u32 LE) | total=1(u32 LE) | index=0(u32 LE) | payload bytes]
+   */
+  function _wrapSingleFragment(bytes) {
+    const frame = new ArrayBuffer(12 + bytes.byteLength);
+    const view  = new DataView(frame);
+    view.setUint32(0, (Math.random() * 0xFFFFFFFF) >>> 0, true); // transferId (random, matches desktop)
+    view.setUint32(4, 1, true);                                   // total = 1 (single fragment)
+    view.setUint32(8, 0, true);                                   // index = 0
+    new Uint8Array(frame, 12).set(new Uint8Array(bytes));
+    return frame;
+  }
 
   function _toB64(arrayBuffer) {
     const bytes = new Uint8Array(arrayBuffer);
