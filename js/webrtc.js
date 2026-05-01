@@ -60,7 +60,10 @@ function initialBufHigh() {
 // Chunks are striped across them (chunkIndex % pool.length) so each channel
 // is its own independent SCTP stream — parallel without head-of-line blocking.
 // No per-file channel setup overhead: pool is established at peer connect time.
-const XFER_POOL_SIZE = 4;
+// 8 channels: large app chunks (512 KB–1 MB) fragment into 2–4 DC frames each,
+// so 4 channels could bottleneck a single DC's loop with serial fragment work.
+// 8 channels halves that serialization pressure with negligible connection overhead.
+const XFER_POOL_SIZE = 8;
 
 export class WebRTCMesh extends EventTarget {
   constructor(sendSignal, myPeerId) {
@@ -395,13 +398,13 @@ export class WebRTCMesh extends EventTarget {
         // doesn't blast 4 MB into Android's SCTP receive window.
         const budget = this._xferBufHigh.get(senderId);
         if (budget) {
-          budget._bufHigh = BUF_MIN;        // start conservative (32 KB)
-          budget._bufMax  = 512 * 1024;     // cap growth at 512 KB for Android peers
+          budget._bufHigh = BUF_MIN;          // start conservative (32 KB)
+          budget._bufMax  = 2 * 1024 * 1024; // 2 MB — ~8 DC fragments in-flight; adaptive shrinks if Kotlin IO_EXEC bottlenecks
         }
         console.log(
           '[mesh] 📱 peer', senderId.slice(0, 8),
           '— Android detected, native WebRTC path active (NativeRtcBridge.kt)',
-          '| budget clamped to', BUF_MIN / 1024, 'KB (max 512 KB)',
+          '| budget clamped to', BUF_MIN / 1024, 'KB (max 2 MB)',
           '| total android peers:', this._androidPeers.size,
         );
       }
@@ -462,6 +465,10 @@ export class WebRTCMesh extends EventTarget {
     // read (dc._sharedBufHigh ?? dc)._bufHigh, so a mismatched key silently
     // returned undefined and fell back to BUF_MIN (32 KB) for every pool send,
     // causing immediate back-pressure stalls and transfer_cancel on desktop peers.
+    // _bufMax is intentionally absent here — Android detection hasn't happened yet
+    // (answer hasn't arrived). handleSignal retroactively sets _bufMax on the same
+    // shared object when the answer arrives, before _peerTypeReady resolves and
+    // getPoolChannels unblocks — so no sendOnChannel call ever sees a missing cap.
     const shared = { _bufHigh: initialBufHigh() };
     this._xferBufHigh.set(peerId, shared);
 
@@ -554,7 +561,7 @@ export class WebRTCMesh extends EventTarget {
             const isAndroid = this._androidPeers.has(peerId);
             const shared = {
               _bufHigh: isAndroid ? BUF_MIN : initialBufHigh(),
-              ...(isAndroid && { _bufMax: 512 * 1024 }),
+              ...(isAndroid && { _bufMax: 2 * 1024 * 1024 }),
             };
             this._xferBufHigh.set(peerId, shared);
             pool.forEach(dc => { dc._sharedBufHigh = shared; dc._peerId = peerId; });
