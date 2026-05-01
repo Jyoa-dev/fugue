@@ -243,10 +243,20 @@ export function initAndroidBridge(WebRTCMesh) {
     mesh.sendSignal({ type: 'rtc_offer', targetId: peerId, sdp: JSON.parse(sdpJson), senderId: mesh.myPeerId, _android: true });
   };
 
+  // Stable reference to the active mesh — updated every time _nativeRtcReady fires.
+  // _nativeBinary uses this instead of window._webrtcMesh directly because
+  // _initRTC() can replace the mesh object (on reconnect) after _nativeBinary
+  // was registered, leaving window._webrtcMesh pointing to the new mesh while
+  // the binary listener is on the old one. _nativeRtcReady always fires on the
+  // new mesh after _initRTC sets window._webrtcMesh, so capturing it here
+  // guarantees _nativeBinary dispatches on the same object room.js listens to.
+  let _activeMesh = null;
+
   window._nativeRtcReady = (peerId) => {
     _log('_nativeRtcReady — shared DC open for', peerId.slice(0,8));
     const mesh = window._webrtcMesh;
     if (!mesh) { _warn('_nativeRtcReady — no _webrtcMesh'); return; }
+    _activeMesh = mesh;
     mesh._dcs.set(peerId, { readyState: 'open', _nativePeer: peerId });
     const leftoverIce = mesh._icePending.get(peerId);
     if (leftoverIce?.length) {
@@ -304,11 +314,11 @@ export function initAndroidBridge(WebRTCMesh) {
   window._nativeRelayReceipt= null; // assigned by room.js
 
   // Inbound non-chunk frames (chat, lan_caps) forwarded from Kotlin.
-  // Mirrors the 'binary' CustomEvent that webrtc.js _handleFrame() dispatches
-  // on desktop so room.js receives them identically on both platforms.
+  // Uses _activeMesh (captured in _nativeRtcReady) rather than window._webrtcMesh
+  // so reconnects that replace the mesh object don't break the dispatch target.
   window._nativeBinary = (peerId, b64) => {
-    const mesh = window._webrtcMesh;
-    if (!mesh) { _warn('_nativeBinary — no _webrtcMesh'); return; }
+    const mesh = _activeMesh || window._webrtcMesh;
+    if (!mesh) { _warn('_nativeBinary — no mesh'); return; }
     _dbg('_nativeBinary from', peerId.slice(0,8), 'len=', b64.length);
     mesh.dispatchEvent(new CustomEvent('binary', { detail: { peerId, buffer: _fromB64(b64) } }));
   };
