@@ -597,6 +597,21 @@ export class Room {
         }
         break;
 
+      case 'file_send_start':
+        // Sender emits this once isAndroidPeer and effectiveChunkSize are known
+        // (at _sendChunks time, after the WebRTC handshake). Corrects the stride
+        // and totalChunks that file_announce sent with desktop-computed values.
+        // On Android: forward to Kotlin so NativeAssembler uses the right offset.
+        // On desktop: no-op (AndroidRtc absent).
+        if (msg.targetId !== this.myPeerId) break;
+        if (typeof window.AndroidRtc !== 'undefined') {
+          console.log('[file_send_start] → AndroidRtc.updateFileMeta', {
+            fileId: msg.fileId?.slice(0, 8), chunkSize: msg.chunkSize, totalChunks: msg.totalChunks,
+          });
+          window.AndroidRtc.updateFileMeta(msg.fileId, msg.chunkSize, msg.totalChunks);
+        }
+        break;
+
       case 'manifest':
         for (const f of msg.files) { if (!this.fileStore.get(f.id)) this.fileStore.register(f); }
         this.onFileUpdate?.();
@@ -920,12 +935,32 @@ export class Room {
 
     // effectiveChunkSize: pool path uses _sendOnDC which auto-fragments, so
     // no Android-specific cap is needed. Both peer types use the same chunk size.
-    const effectiveChunkSize = this._computeChunkSize(entry.file.size, isAndroidPeer);
+    const effectiveChunkSize   = this._computeChunkSize(entry.file.size, isAndroidPeer);
+    const effectiveTotalChunks = Math.ceil(entry.file.size / effectiveChunkSize) || 1;
 
     // Seed log — both peer types use the pool path now.
     if (isAndroidPeer) {
       console.log('[sendChunks] Android peer — pool path (4 DCs) for', requesterId.slice(0, 8));
     }
+
+    // ── file_send_start: correct Kotlin's stride before the first chunk ───
+    // file_announce is sent at shareFile() time, before isAndroidPeer is known,
+    // so it carries the desktop totalChunks and no chunkSize at all.
+    // Now that both are exact, relay a small correction so Kotlin's NativeAssembler
+    // uses the right seek stride from the very first chunk it writes.
+    // On the receiver side, _handle 'file_send_start' calls AndroidRtc.updateFileMeta.
+    // targetId lets the relay server route this only to the requester.
+    // Desktop receivers ignore this message (no AndroidRtc).
+    this.relay.send({
+      type      : 'file_send_start',
+      fileId,
+      targetId  : requesterId,
+      chunkSize : effectiveChunkSize,
+      totalChunks: effectiveTotalChunks,
+    });
+    console.log('[sendChunks] sent file_send_start', {
+      fileId: fileId.slice(0, 8), effectiveChunkSize, effectiveTotalChunks, isAndroidPeer,
+    });
 
     const sendOne = async (chunk) => {
       if (this._cancelled.has(fileId) || aborted) return;
