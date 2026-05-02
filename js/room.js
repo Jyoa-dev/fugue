@@ -307,10 +307,15 @@ export class Room {
     // Listen for files delivered by the Kotlin native picker.
     // webrtc_android_bridge.js wraps them as NativeFile objects and dispatches
     // this event so room.js (and any UI layer) can consume them uniformly.
+    // NativeFile.sendChunk() will be used in _sendChunks — no base64 bridge crossing.
     window.addEventListener('native-files-picked', (e) => {
       const { files } = e.detail;
       if (!files?.length) return;
+      console.log('[room] native-files-picked ✓ NATIVE PICKER —', files.length, 'file(s) — fast-path send will be used');
       for (const nativeFile of files) {
+        const hasFastPath = typeof nativeFile.sendChunk === 'function';
+        console.log('[room] NativeFile:', nativeFile.name, 'size:', nativeFile.size,
+          '| fast-path (sendChunk):', hasFastPath ? '✓ YES' : '✗ NO — will use slow arrayBuffer path');
         // shareFile() expects a File-like object with .name .size .type and
         // either .arrayBuffer() or .slice() — NativeFile provides both.
         this.shareFile(nativeFile).catch(err => {
@@ -325,9 +330,11 @@ export class Room {
 
   openNativeFilePicker() {
     if (typeof window.AndroidRtc !== 'undefined' && window.AndroidRtc.openFilePicker) {
+      console.log('[room] openNativeFilePicker → NATIVE path (AndroidRtc.openFilePicker)');
       window.AndroidRtc.openFilePicker();
     } else {
       // Desktop fallback: trigger a hidden file input.
+      console.log('[room] openNativeFilePicker → WEB FALLBACK (no AndroidRtc — using <input type=file>)');
       const input     = document.createElement('input');
       input.type      = 'file';
       input.multiple  = true;
@@ -964,6 +971,38 @@ export class Room {
 
     const sendOne = async (chunk) => {
       if (this._cancelled.has(fileId) || aborted) return;
+
+      // ── Native fast-path: NativeFile.sendChunk() ─────────────────────────
+      // When the sender is Android and the file came from the native picker,
+      // entry.file is a NativeFile with a sendChunk() method.  One bridge call
+      // (readAndSendChunk) reads the FileChannel, encrypts AES-GCM, builds the
+      // full wire frame (transport hdr + app hdr + ciphertext), and calls dc.send()
+      // entirely in Kotlin — no base64, no JS encrypt, no sendPool() round-trip.
+      //
+      // Falls back to the legacy path if:
+      //   • file is not a NativeFile (desktop web File object)
+      //   • Kotlin build is too old (readAndSendChunk absent → sendChunk returns false)
+      //   • any per-chunk send failure (false return → legacy path retries that chunk)
+      if (typeof entry.file.sendChunk === 'function') {
+        const offset    = chunk.index * effectiveChunkSize;
+        const poolIndex = chunk.index % dcPool.length;
+        const ok = entry.file.sendChunk(
+          offset, effectiveChunkSize,
+          requesterId, poolIndex,
+          fileId,           // Kotlin strips dashes internally
+          chunk.index, chunk.total,
+          !!this._crypto,   // encryptedFlag
+        );
+        if (ok) {
+          if (chunk.index === 0) console.log('[sendChunks] FAST-PATH active — readAndSendChunk() confirmed for', fileId.slice(0,8));
+          return;
+        }
+        // ok===false: Kotlin returned false (DC not open, key not ready, etc.)
+        // or readAndSendChunk is absent on this build. Fall through to legacy.
+        if (chunk.index === 0) console.warn('[sendChunks] fast-path unavailable (sendChunk=false) — falling back to legacy path for', fileId.slice(0,8));
+      }
+
+      // ── Legacy path (desktop, or fast-path fallback) ──────────────────────
       let chunkBuf = chunk.data;
       if (this._crypto) chunkBuf = await this._crypto.encrypt(chunk.data, 'session');
       if (this._cancelled.has(fileId) || aborted) return; // recheck after async encrypt

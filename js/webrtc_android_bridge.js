@@ -288,11 +288,16 @@ export function initAndroidBridge(WebRTCMesh) {
     _log('_nativeRtcPoolReady — all pool DCs open for', peerId.slice(0,8));
     const mesh = window._webrtcMesh;
     if (!mesh) { _warn('_nativeRtcPoolReady — no _webrtcMesh'); return; }
-    const pool = Array.from({ length: 4 }, (_, i) => ({
+    // Pool size must match XFER_POOL_SIZE in webrtc.js and NativeRtcBridge.kt (both = 8).
+    // Previously hardcoded as 4 — caused room.js to stripe chunks across only 4 DCs
+    // while Kotlin opened 8, leaving 4 DCs idle and halving potential throughput.
+    const POOL_SIZE = 8;
+    const pool = Array.from({ length: POOL_SIZE }, (_, i) => ({
       _nativePool: { peerId, index: i },
       label: `xferp-${i}`,
       readyState: 'open',
     }));
+    _log('_nativeRtcPoolReady — created', POOL_SIZE, 'pool DC stubs for', peerId.slice(0,8));
     mesh._xferPool.set(peerId, pool);
     mesh._xferPoolResolve.get(peerId)?.(pool);
     mesh._xferPoolResolve.delete(peerId);
@@ -344,7 +349,8 @@ export function initAndroidBridge(WebRTCMesh) {
   // ── Native file picker callbacks ──────────────────────────────────────────
 
   window._nativeFilePicked = (files) => {
-    _log('_nativeFilePicked count=', files.length);
+    _log('_nativeFilePicked ✓ NATIVE PICKER — count=', files.length,
+         '| this confirms the native Kotlin picker ran, NOT the WebView <input type=file>');
     window.dispatchEvent(new CustomEvent('native-files-picked', {
       detail: { files: files.map(f => new NativeFile(f)) }
     }));
@@ -357,12 +363,20 @@ export function initAndroidBridge(WebRTCMesh) {
       this.size   = size;
       this.type   = mime;
       this.lastModified = Date.now();
+      _log('NativeFile created — token=', token.slice(0,8), 'name=', name,
+           'size=', size, '| fast-path: sendChunk() will call readAndSendChunk()');
     }
-    async arrayBuffer() { return _readNativeRange(this._token, 0, this.size); }
+    async arrayBuffer() {
+      _warn('NativeFile.arrayBuffer() called — SLOW PATH (reads via bridge base64)', this.name);
+      return _readNativeRange(this._token, 0, this.size);
+    }
     slice(start = 0, end = this.size) {
       return new NativeBlob(this._token, start, end - start, this.type);
     }
-    release() { window.AndroidRtc.releaseFileToken(this._token); }
+    release() {
+      _log('NativeFile.release() token=', this._token.slice(0,8));
+      window.AndroidRtc.releaseFileToken(this._token);
+    }
 
     /**
      * Fast-path outbound send for file chunks.
@@ -379,7 +393,10 @@ export function initAndroidBridge(WebRTCMesh) {
       this._token = token; this._offset = offset;
       this._length = length; this.size = length; this.type = type;
     }
-    async arrayBuffer() { return _readNativeRange(this._token, this._offset, this._length); }
+    async arrayBuffer() {
+      _warn('NativeBlob.arrayBuffer() called — SLOW PATH (reads via bridge base64) offset=', this._offset);
+      return _readNativeRange(this._token, this._offset, this._length);
+    }
 
     /**
      * Fast-path outbound send — eliminates the double base64 round-trip.
@@ -390,24 +407,21 @@ export function initAndroidBridge(WebRTCMesh) {
      *   read chunk → encrypt (AES-GCM, session key) → build 26-byte DC header → dc.send()
      *
      * @param {string}  peerId        - destination peer UUID
-     * @param {number}  poolIndex     - pool DC index (0–3)
-     * @param {string}  fileIdHex     - 8-char hex file-ID embedded in the DC frame header
+     * @param {number}  poolIndex     - pool DC index (0–7)
+     * @param {string}  fileIdHex     - UUID (dashes OK — Kotlin strips them)
      * @param {number}  chunkIndex    - 0-based chunk sequence number
      * @param {number}  totalChunks   - total chunks for this transfer
      * @param {boolean} [encryptedFlag=true] - pass false only for unencrypted debug transfers
      * @returns {boolean} false if Kotlin reports a send failure (caller should abort transfer)
-     *
-     * Requires AndroidRtc.readAndSendChunk() @JavascriptInterface (see contract in file header).
-     * Falls back silently to false (not an exception) if the method is absent so callers can
-     * detect an outdated Kotlin build and degrade to the legacy arrayBuffer() path.
      */
     sendChunk(peerId, poolIndex, fileIdHex, chunkIndex, totalChunks, encryptedFlag = true) {
       if (typeof window.AndroidRtc.readAndSendChunk !== 'function') {
-        _warn('sendChunk — AndroidRtc.readAndSendChunk not available; Kotlin build may be outdated');
+        _warn('sendChunk — AndroidRtc.readAndSendChunk NOT available — Kotlin build outdated, returning false');
         return false;
       }
-      _dbg('sendChunk (native fast-path)', peerId.slice(0, 8),
-           '| pool:', poolIndex, '| chunk:', chunkIndex, '/', totalChunks);
+      _dbg('sendChunk FAST-PATH → readAndSendChunk',
+           '| pool:', poolIndex, '| chunk:', chunkIndex, '/', totalChunks,
+           '| offset:', this._offset, '| len:', this._length);
       return window.AndroidRtc.readAndSendChunk(
         this._token,
         this._offset,
