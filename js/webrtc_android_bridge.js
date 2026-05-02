@@ -208,6 +208,15 @@ export function initAndroidBridge(WebRTCMesh) {
   proto.getPoolChannels = function(peerId, timeoutMs = 10_000) {
     const pc = this._pcs.get(peerId);
     if (!pc?._native) return _origGetPoolChannels.call(this, peerId, timeoutMs);
+
+    // Guard: you can never open a pool channel to yourself.
+    if (peerId === this.myPeerId) {
+      _warn('getPoolChannels (native) — peerId equals myPeerId! Caller passed own ID.',
+            '| myPeerId:', this.myPeerId.slice(0,8),
+            '| Stack:', new Error().stack.split('\n').slice(1,4).join(' ▸ '));
+      return Promise.reject(new Error('[android-bridge] getPoolChannels called with own peerId'));
+    }
+
     _log('getPoolChannels (native)', peerId.slice(0,8));
     if (this._xferPool.has(peerId)) {
       _log('getPoolChannels (native) — pool already ready for', peerId.slice(0,8));
@@ -237,14 +246,35 @@ export function initAndroidBridge(WebRTCMesh) {
   // NativeBlob.sendChunk() / NativeFile.sendChunk() instead — those avoid the
   // double base64 round-trip by calling AndroidRtc.readAndSendChunk() directly.
   // JS → Kotlin: encode frame as base64, call @JavascriptInterface sendPool.
+  //
+  // NOTE: sendPool frames go directly to Kotlin's dc.send() — they must NOT carry
+  // the _sendOnDC transport header here because readAndSendChunk() already builds
+  // the complete wire frame (transport header + app header + payload) internally.
+  // Control frames sent via this path (relay receipts, etc.) are raw app frames
+  // that Kotlin forwards to the remote peer as-is via sendBytes().
   const _origSendOnChannel = proto.sendOnChannel;
   proto.sendOnChannel = function(dc, buffer) {
     if (!dc._nativePool) return _origSendOnChannel.call(this, dc, buffer);
     const { peerId, index } = dc._nativePool;
-    _dbg('sendOnChannel (native pool)', peerId.slice(0,8), '| channel index:', index);
+
+    // Guard: peerId must be the REMOTE peer, never our own ID.
+    // If peerId === this.myPeerId something upstream passed the wrong peer ID
+    // (e.g. room.js calling getPoolChannels(myPeerId) instead of senderPeerId).
+    // Kotlin's peers map is keyed by remote ID so this would always miss.
+    if (peerId === this.myPeerId) {
+      _warn('sendOnChannel (native pool) — peerId equals myPeerId! Caller passed own ID as destination.',
+            '| peerId:', peerId.slice(0,8), '| index:', index,
+            '| This is a bug in the caller — pool DC lookup in Kotlin will fail.');
+      return Promise.reject(new Error('[android-bridge] sendOnChannel called with own peerId as destination'));
+    }
+
+    _log('sendOnChannel (native pool)', peerId.slice(0,8), '| channel index:', index);
     return Promise.resolve().then(() => {
       const bytes = buffer instanceof ArrayBuffer ? buffer : buffer.buffer;
-      window.AndroidRtc.sendPool(peerId, index, _toB64(bytes));
+      const ok = window.AndroidRtc.sendPool(peerId, index, _toB64(bytes));
+      if (!ok) _warn('sendOnChannel (native pool) — sendPool returned false',
+                     '| peerId:', peerId.slice(0,8), '| idx:', index,
+                     '| DC not open in Kotlin yet? Pool ready =', window.AndroidRtc.isPoolReady(peerId));
     });
   };
 
@@ -288,6 +318,27 @@ export function initAndroidBridge(WebRTCMesh) {
     _log('_nativeRtcPoolReady — all pool DCs open for', peerId.slice(0,8));
     const mesh = window._webrtcMesh;
     if (!mesh) { _warn('_nativeRtcPoolReady — no _webrtcMesh'); return; }
+
+    // Guard: Kotlin fires _nativeRtcPoolReady with the remote peer ID.
+    // If it matches myPeerId something has gone wrong in Kotlin's peer map.
+    if (peerId === mesh.myPeerId) {
+      _warn('_nativeRtcPoolReady — peerId equals myPeerId! Kotlin fired pool-ready with own ID.',
+            '| peerId:', peerId.slice(0,8), '| myPeerId:', mesh.myPeerId.slice(0,8),
+            '| Ignoring — this would make all sendPool calls target self, always missing in Kotlin peers map.');
+      return;
+    }
+
+    // Verify Kotlin confirms the pool is actually open before exposing it to room.js.
+    // isPoolReady() checks that peers[peerId].poolDcs has XFER_POOL_SIZE open DCs —
+    // this closes the race where _nativeRtcPoolReady fires during the last DC's
+    // onStateChange but a concurrent sendPool call races in before the DC list is full.
+    if (!window.AndroidRtc.isPoolReady(peerId)) {
+      _warn('_nativeRtcPoolReady — Kotlin fired pool-ready but isPoolReady() is false for',
+            peerId.slice(0,8), '| deferring 50 ms');
+      setTimeout(() => window._nativeRtcPoolReady(peerId), 50);
+      return;
+    }
+
     // Pool size must match XFER_POOL_SIZE in webrtc.js and NativeRtcBridge.kt (both = 8).
     // Previously hardcoded as 4 — caused room.js to stripe chunks across only 4 DCs
     // while Kotlin opened 8, leaving 4 DCs idle and halving potential throughput.
@@ -347,6 +398,17 @@ export function initAndroidBridge(WebRTCMesh) {
   };
 
   // ── Native file picker callbacks ──────────────────────────────────────────
+
+  // Override openFilePicker to ensure the native Kotlin picker always fires
+  // and the WebView <input type=file> path is never reached for file transfers.
+  // This is called by room.js / app.js when the user triggers a file pick action.
+  // On Android, we call AndroidRtc.openFilePicker() which fires the Kotlin
+  // filePickerCallback → nativeFilePickerLauncher in MainActivity → system picker.
+  // The result flows back via _nativeFilePicked, never through WebChromeClient.
+  proto.openFilePicker = function() {
+    _log('openFilePicker — calling AndroidRtc.openFilePicker() (native Kotlin path)');
+    window.AndroidRtc.openFilePicker();
+  };
 
   window._nativeFilePicked = (files) => {
     _log('_nativeFilePicked ✓ NATIVE PICKER — count=', files.length,
