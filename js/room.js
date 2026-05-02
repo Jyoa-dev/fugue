@@ -506,10 +506,15 @@ export class Room {
         this.fileStore.updateProgress(fileId, 1);
         this.onFileUpdate?.();
         this.onMessage?.({ type: 'system', text: `${name} saved to Downloads`, subtype: 'receipt' });
-        // Stop the foreground service if no other downloads are still active.
-        const activeDownloads = this.fileStore.getAll()
-          .filter(f => f.status === 'downloading').length;
-        if (activeDownloads === 0) window.AndroidRtc.stopTransferService?.();
+        // Defer by one event-loop tick: a re-download's requestFile() may have already
+        // called startTransferService() synchronously just before this callback fired.
+        // Without the deferral, stopTransferService() runs first, killing the foreground
+        // service immediately, and the re-download stalls or never restarts.
+        setTimeout(() => {
+          const activeDownloads = this.fileStore.getAll()
+            .filter(f => f.status === 'downloading').length;
+          if (activeDownloads === 0) window.AndroidRtc.stopTransferService?.();
+        }, 0);
       };
 
       window._nativeFileError = (fileId, name, msg) => {
@@ -518,9 +523,13 @@ export class Room {
         this.fileStore.setStatus(fileId, 'error');
         this.onFileUpdate?.();
         this.onMessage?.({ type: 'system', text: `Failed to save ${name}: ${msg}`, subtype: 'warning' });
-        const activeDownloads = this.fileStore.getAll()
-          .filter(f => f.status === 'downloading').length;
-        if (activeDownloads === 0) window.AndroidRtc.stopTransferService?.();
+        // Defer — same race as _nativeFileDone: a retry's startTransferService() may
+        // run in the same tick. Let it win before we potentially stop the service.
+        setTimeout(() => {
+          const activeDownloads = this.fileStore.getAll()
+            .filter(f => f.status === 'downloading').length;
+          if (activeDownloads === 0) window.AndroidRtc.stopTransferService?.();
+        }, 0);
       };
 
       window._nativeRelayReceipt = (fileId, peerId) => {
@@ -1120,6 +1129,11 @@ export class Room {
           chunk.index, chunk.total,
           !!this._crypto,   // encryptedFlag
         );
+        // Recheck cancelled — a transfer_pause relay message may have arrived and set
+        // _cancelled while readAndSendChunk was executing inside Kotlin (it is a
+        // synchronous @JavascriptInterface call that can take ~1 ms for large chunks).
+        // Without this check the loop continues to queue the next sendOne immediately.
+        if (this._cancelled.has(fileId)) return;
         if (ok) {
           if (chunk.index === 0) console.log('[sendChunks] FAST-PATH active — readAndSendChunk() confirmed for', fileId.slice(0,8));
           return;
@@ -1166,6 +1180,9 @@ export class Room {
 
       const dc = dcPool[chunk.index % dcPool.length];
       await this._rtc.sendOnChannel(dc, frame);
+      // Recheck after the back-pressure drain — sendOnChannel can park here for
+      // hundreds of ms on a slow link, during which transfer_pause may have arrived.
+      if (this._cancelled.has(fileId)) return;
     };
 
     // ── Android: native loop — never reads file bytes into JS ───────────────
@@ -1428,10 +1445,15 @@ export class Room {
     // reset the file message back to its pre-download (offer) state.
     this.onMessage?.({ type: 'file_cancel', fileId });
     // Stop the foreground service if nothing else is downloading.
+    // Defer by one tick: another file's requestFile() (→ startTransferService) may run
+    // in the same synchronous call stack. Let it register first so we don't stop the
+    // service prematurely and freeze an unrelated in-progress transfer.
     if (typeof window.AndroidRtc !== 'undefined') {
-      const activeDownloads = this.fileStore.getAll()
-        .filter(f => f.status === 'downloading').length;
-      if (activeDownloads === 0) window.AndroidRtc.stopTransferService?.();
+      setTimeout(() => {
+        const activeDownloads = this.fileStore.getAll()
+          .filter(f => f.status === 'downloading').length;
+        if (activeDownloads === 0) window.AndroidRtc.stopTransferService?.();
+      }, 0);
     }
   }
 
