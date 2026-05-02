@@ -326,6 +326,25 @@ export class Room {
         });
       }
     });
+
+    // ── Intercept all <input type=file> clicks on Android ────────────────────
+    // app.js and other callers may create their own <input type=file> elements
+    // and call .click() on them directly, bypassing openNativeFilePicker().
+    // On Android the WebChromeClient onShowFileChooser callback fires, but only
+    // when the input is attached to the DOM and clicked — programmatic click()
+    // on a detached input silently fails in many WebView versions.
+    // Patch HTMLInputElement.click so any type=file click is redirected to
+    // the native Kotlin picker, which is reliable across all WebView versions.
+    const _origInputClick = HTMLInputElement.prototype.click;
+    HTMLInputElement.prototype.click = function() {
+      if (this.type === 'file') {
+        console.log('[room] <input type=file>.click() intercepted on Android — redirecting to native picker');
+        window.AndroidRtc.openFilePicker();
+        return;
+      }
+      return _origInputClick.call(this);
+    };
+    console.log('[room] <input type=file> click interceptor installed (Android native picker)');
   }
 
   openNativeFilePicker() {
@@ -634,7 +653,7 @@ export class Room {
     // _nativeProgress / _nativeFileDone fire when Kotlin is done — no JS work needed.
     if (fromDC && typeof window.AndroidRtc !== 'undefined') return;
     if (this._cancelled.has(fileId)) return;
-    if (chunkIndex === 0) console.log('[receiveChunk] first chunk', { fileId: fileId.slice(0,8), totalChunks, fromDC, swAvailable: this._swDL.available });
+    console.log('[receiveChunk]', { fileId: fileId.slice(0,8), chunkIndex, totalChunks, fromDC, encrypted, byteLength: chunkBuf?.byteLength, hasCrypto: !!this._crypto, swAvailable: this._swDL.available });
 
     // Speed tracking
     const now = Date.now();
@@ -652,7 +671,10 @@ export class Room {
     let data = chunkBuf;
     if (fromDC && this._crypto && encrypted) {
       try { data = await this._crypto.decrypt(chunkBuf, 'session'); }
-      catch { console.warn('DC chunk decrypt failed'); return; }
+      catch (e) {
+        console.warn('[receiveChunk] DC chunk decrypt FAILED', { fileId: fileId.slice(0,8), chunkIndex, byteLength: chunkBuf?.byteLength, err: e?.message });
+        return;
+      }
     }
 
     const entry = this.fileStore.get(fileId);

@@ -271,7 +271,15 @@ export function initAndroidBridge(WebRTCMesh) {
     _log('sendOnChannel (native pool)', peerId.slice(0,8), '| channel index:', index);
     return Promise.resolve().then(() => {
       const bytes = buffer instanceof ArrayBuffer ? buffer : buffer.buffer;
-      const ok = window.AndroidRtc.sendPool(peerId, index, _toB64(bytes));
+      // _handleFrame on the desktop ALWAYS expects a 12-byte _sendOnDC transport
+      // header: [transferId(u32 LE) | total(u32 LE) | index(u32 LE)] prepended to
+      // every dc.send() payload. Without it, _handleFrame reads the first 12 bytes
+      // of the app frame as a fragment header, interprets the UUID bytes as a
+      // nonsensical totalFragments count, and the chunk is swallowed by the
+      // fragment assembler and never dispatched as a 'binary' event.
+      // _wrapSingleFragment mirrors what _sendOnDC does for total===1 frames.
+      const wrapped = _wrapSingleFragment(bytes);
+      const ok = window.AndroidRtc.sendPool(peerId, index, _toB64(wrapped));
       if (!ok) _warn('sendOnChannel (native pool) — sendPool returned false',
                      '| peerId:', peerId.slice(0,8), '| idx:', index,
                      '| DC not open in Kotlin yet? Pool ready =', window.AndroidRtc.isPoolReady(peerId));
