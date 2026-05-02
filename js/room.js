@@ -316,13 +316,14 @@ export class Room {
         const hasFastPath = typeof nativeFile.sendChunk === 'function';
         console.log('[room] NativeFile:', nativeFile.name, 'size:', nativeFile.size,
           '| fast-path (sendChunk):', hasFastPath ? '✓ YES' : '✗ NO — will use slow arrayBuffer path');
-        // shareFile() expects a File-like object with .name .size .type and
-        // either .arrayBuffer() or .slice() — NativeFile provides both.
+        // shareFile() only registers metadata and announces — the file bytes are
+        // not read until _sendChunks() runs (after file_request arrives from the
+        // receiver). Do NOT release the NativeFile token here: the FileChannel
+        // must stay open until _sendChunks() has drained all chunks.
+        // release() is stored on the fileStore entry and called by _sendChunks().
         this.shareFile(nativeFile).catch(err => {
           console.error('[room] shareFile(NativeFile) failed:', err);
-        }).finally(() => {
-          // Release the Kotlin-side ContentResolver reference when done.
-          nativeFile.release?.();
+          nativeFile.release?.(); // release immediately only on shareFile error
         });
       }
     });
@@ -1129,6 +1130,14 @@ export class Room {
     }
     console.log('[sendChunks] done, sent', chunkCount, 'chunks', aborted ? '(aborted)' : '');
 
+    // Release the Kotlin-side FileChannel now that all chunks have been read.
+    // Must happen here — not in shareFile()'s finally — because shareFile() resolves
+    // before file_request arrives and _sendChunks runs. Releasing earlier closes the
+    // FileChannel and makes readAndSendChunk return false for every chunk.
+    if (typeof entry.file.release === 'function') {
+      console.log('[sendChunks] releasing NativeFile token for', fileId.slice(0, 8));
+      entry.file.release();
+    }
 
     if (!aborted && !this._cancelled.has(fileId)) {
       this.fileStore.addReceipt(fileId, requesterId, this.peers.get(requesterId)?.identity || requesterId, 'sent');
