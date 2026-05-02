@@ -500,6 +500,7 @@ export class WebRTCMesh extends EventTarget {
       dc.onopen     = () => onOpen(dc.label);
       dc.onmessage  = ({ data }) => this._handleFrame(peerId, data);
       dc.onerror    = e => console.warn('[pool] DC error', dc.label, peerId, e);
+      dc.onclose    = () => console.warn('[pool] initiator DC CLOSED', dc.label, 'peer', peerId.slice(0,8), '| buffered:', dc.bufferedAmount);
       dcs.push(dc);
     }
     console.log('[pool] _openPool END — created', dcs.length, 'DCs for', peerId.slice(0,8));
@@ -559,6 +560,7 @@ export class WebRTCMesh extends EventTarget {
         channel._peerId    = peerId;
         channel.onmessage  = ({ data }) => this._handleFrame(peerId, data);
         channel.onerror    = e => console.warn('pool DC error', peerId, channel.label, e);
+        channel.onclose    = () => console.warn('[pool] responder DC CLOSED', channel.label, 'peer', peerId.slice(0,8), '| buffered:', channel.bufferedAmount, '| pool size at close:', (this._xferPool.get(peerId) ?? this._xferPoolBuf.get(peerId) ?? []).length);
         if (!this._xferPoolBuf.has(peerId)) this._xferPoolBuf.set(peerId, []);
         const buf = this._xferPoolBuf.get(peerId);
         const onOpen = () => {
