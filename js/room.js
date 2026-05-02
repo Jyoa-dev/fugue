@@ -991,7 +991,13 @@ export class Room {
     // completes, so reading _androidPeers before getPoolChannels (which waits
     // for the connection to be live) would race and return false for Android
     // peers. All Android-dependent values are derived here, after the awaits.
-    const isAndroidPeer = this._rtc._androidPeers?.has(requesterId) === true;
+    // isAndroidPeer: true if the remote peer is Android OR if we ourselves are
+    // Android (sender). When Android is the sender, readAndSendChunk calls dc.send()
+    // directly in Kotlin — the chunk must fit within the 256 KB SCTP ceiling
+    // regardless of who the receiver is. Using the desktop 512 KB chunk size causes
+    // libwebrtc to close the DC immediately after the first send.
+    const isAndroidPeer = this._rtc._androidPeers?.has(requesterId) === true
+                       || typeof window.AndroidRtc !== 'undefined';
     console.log('[sendChunks] isAndroidPeer:', isAndroidPeer, 'for', requesterId.slice(0, 8));
 
     // effectiveChunkSize: pool path uses _sendOnDC which auto-fragments, so
