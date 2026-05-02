@@ -241,26 +241,28 @@ export function initAndroidBridge(WebRTCMesh) {
   };
 
   // ── sendOnChannel — native pool DC ───────────────────────────────────────
-  // Used for non-file frames (small control messages, relay receipts, etc.) that
-  // are already fully assembled in JS.  File chunk senders should use
-  // NativeBlob.sendChunk() / NativeFile.sendChunk() instead — those avoid the
-  // double base64 round-trip by calling AndroidRtc.readAndSendChunk() directly.
-  // JS → Kotlin: encode frame as base64, call @JavascriptInterface sendPool.
+  // Used ONLY for non-file control frames (chat, lan_caps) on pool DCs.
+  // File chunk senders MUST use NativeFile.sendChunk() / NativeBlob.sendChunk()
+  // which call readAndSendChunk() directly in Kotlin — no base64 round-trip.
   //
   // NOTE: sendPool frames go directly to Kotlin's dc.send() — they must NOT carry
   // the _sendOnDC transport header here because readAndSendChunk() already builds
   // the complete wire frame (transport header + app header + payload) internally.
-  // Control frames sent via this path (relay receipts, etc.) are raw app frames
-  // that Kotlin forwards to the remote peer as-is via sendBytes().
+  // Control frames sent via this path are raw app frames that Kotlin forwards to
+  // the remote peer as-is via sendBytes().
+  //
+  // The old retry loop (up to 3 s) was only needed to prop up the legacy file-chunk
+  // path, where sendPool could race ahead of poolDcs registration.  Control frames
+  // are small and sent well after _nativeRtcPoolReady has fired (isPoolReady()
+  // already verified in that callback), so a single attempt is correct.
+  // A false return from sendPool means the DC is genuinely not open — that is a
+  // hard error, not a transient race, so we throw immediately.
   const _origSendOnChannel = proto.sendOnChannel;
   proto.sendOnChannel = function(dc, buffer) {
     if (!dc._nativePool) return _origSendOnChannel.call(this, dc, buffer);
     const { peerId, index } = dc._nativePool;
 
     // Guard: peerId must be the REMOTE peer, never our own ID.
-    // If peerId === this.myPeerId something upstream passed the wrong peer ID
-    // (e.g. room.js calling getPoolChannels(myPeerId) instead of senderPeerId).
-    // Kotlin's peers map is keyed by remote ID so this would always miss.
     if (peerId === this.myPeerId) {
       _warn('sendOnChannel (native pool) — peerId equals myPeerId! Caller passed own ID as destination.',
             '| peerId:', peerId.slice(0,8), '| index:', index,
@@ -269,7 +271,7 @@ export function initAndroidBridge(WebRTCMesh) {
     }
 
     _log('sendOnChannel (native pool)', peerId.slice(0,8), '| channel index:', index);
-    return Promise.resolve().then(() => {
+    return (async () => {
       const bytes = buffer instanceof ArrayBuffer ? buffer : buffer.buffer;
       // _handleFrame on the desktop ALWAYS expects a 12-byte _sendOnDC transport
       // header: [transferId(u32 LE) | total(u32 LE) | index(u32 LE)] prepended to
@@ -279,11 +281,13 @@ export function initAndroidBridge(WebRTCMesh) {
       // fragment assembler and never dispatched as a 'binary' event.
       // _wrapSingleFragment mirrors what _sendOnDC does for total===1 frames.
       const wrapped = _wrapSingleFragment(bytes);
-      const ok = window.AndroidRtc.sendPool(peerId, index, _toB64(wrapped));
-      if (!ok) _warn('sendOnChannel (native pool) — sendPool returned false',
-                     '| peerId:', peerId.slice(0,8), '| idx:', index,
-                     '| DC not open in Kotlin yet? Pool ready =', window.AndroidRtc.isPoolReady(peerId));
-    });
+      const b64 = _toB64(wrapped);
+      if (!window.AndroidRtc.sendPool(peerId, index, b64)) {
+        const msg = `[android-bridge] sendOnChannel: sendPool failed for ${peerId.slice(0,8)} idx=${index} — DC not open`;
+        _warn(msg);
+        throw new Error(msg);
+      }
+    })();
   };
 
   // ── Kotlin → JS callbacks ─────────────────────────────────────────────────

@@ -327,6 +327,12 @@ export class Room {
       }
     });
 
+    // ── Confirm native picker is active ─────────────────────────────────────
+    // Look for this in logcat to confirm the native picker path is wired.
+    // If you see "WEB FALLBACK" instead, filePickerCallback is null in Kotlin.
+    console.log('%c[PICKER] Android native file picker ACTIVE — input.click() intercepted',
+      'background:#1a7f37;color:#fff;font-weight:bold;padding:2px 6px;border-radius:3px');
+
     // ── Intercept all <input type=file> clicks on Android ────────────────────
     // app.js and other callers may create their own <input type=file> elements
     // and call .click() on them directly, bypassing openNativeFilePicker().
@@ -338,12 +344,30 @@ export class Room {
     const _origInputClick = HTMLInputElement.prototype.click;
     HTMLInputElement.prototype.click = function() {
       if (this.type === 'file') {
-        console.log('[room] <input type=file>.click() intercepted on Android — redirecting to native picker');
+        console.log('%c[PICKER] input.click() intercepted → native picker', 'background:#1a7f37;color:#fff;font-weight:bold;padding:2px 6px;border-radius:3px');
+        console.trace('[PICKER] caller stack');
         window.AndroidRtc.openFilePicker();
         return;
       }
       return _origInputClick.call(this);
     };
+
+    // showPicker() is a second entry-point (Chrome 86+) that bypasses .click().
+    // Intercept it for the same reason.
+    if (typeof HTMLInputElement.prototype.showPicker === 'function') {
+      const _origShowPicker = HTMLInputElement.prototype.showPicker;
+      HTMLInputElement.prototype.showPicker = function() {
+        if (this.type === 'file') {
+          console.log('%c[PICKER] input.showPicker() intercepted → native picker', 'background:#1a7f37;color:#fff;font-weight:bold;padding:2px 6px;border-radius:3px');
+          console.trace('[PICKER] caller stack');
+          window.AndroidRtc.openFilePicker();
+          return;
+        }
+        return _origShowPicker.call(this);
+      };
+      console.log('[room] <input type=file> showPicker() interceptor installed');
+    }
+
     console.log('[room] <input type=file> click interceptor installed (Android native picker)');
   }
 
@@ -353,7 +377,14 @@ export class Room {
       window.AndroidRtc.openFilePicker();
     } else {
       // Desktop fallback: trigger a hidden file input.
-      console.log('[room] openNativeFilePicker → WEB FALLBACK (no AndroidRtc — using <input type=file>)');
+      // On Android this branch should NEVER be reached — AndroidRtc is always present.
+      // If you see this on Android, the bridge was not injected before room.js ran.
+      if (typeof window.AndroidRtc !== 'undefined') {
+        console.error('%c[PICKER] WEB FALLBACK reached on Android — AndroidRtc present but openFilePicker missing! This is a bug.', 'background:#b91c1c;color:#fff;font-weight:bold;padding:2px 6px;border-radius:3px');
+        console.trace('[PICKER] web fallback caller stack');
+      } else {
+        console.log('[room] openNativeFilePicker → WEB FALLBACK (no AndroidRtc — desktop path)');
+      }
       const input     = document.createElement('input');
       input.type      = 'file';
       input.multiple  = true;
@@ -994,18 +1025,30 @@ export class Room {
     const sendOne = async (chunk) => {
       if (this._cancelled.has(fileId) || aborted) return;
 
-      // ── Native fast-path: NativeFile.sendChunk() ─────────────────────────
-      // When the sender is Android and the file came from the native picker,
-      // entry.file is a NativeFile with a sendChunk() method.  One bridge call
-      // (readAndSendChunk) reads the FileChannel, encrypts AES-GCM, builds the
-      // full wire frame (transport hdr + app hdr + ciphertext), and calls dc.send()
-      // entirely in Kotlin — no base64, no JS encrypt, no sendPool() round-trip.
+      // ── Android fast-path: NativeFile.sendChunk() ────────────────────────
+      // On Android the ONLY supported send path for file chunks is readAndSendChunk:
+      // Kotlin reads the FileChannel, encrypts AES-GCM, builds the full wire frame
+      // (transport hdr + app hdr + ciphertext), and calls dc.send() — no base64,
+      // no JS encrypt, no sendPool() round-trip.
       //
-      // Falls back to the legacy path if:
-      //   • file is not a NativeFile (desktop web File object)
-      //   • Kotlin build is too old (readAndSendChunk absent → sendChunk returns false)
-      //   • any per-chunk send failure (false return → legacy path retries that chunk)
-      if (typeof entry.file.sendChunk === 'function') {
+      // If entry.file is not a NativeFile (e.g. came from the web picker instead of
+      // the native Kotlin picker) sendChunk is absent.  On Android this is always a
+      // misconfiguration — the input intercept in _initNativeFilePicker should have
+      // redirected every file pick to the native picker.  Abort immediately with a
+      // clear error rather than silently falling through to the legacy base64 path,
+      // which is removed from the Android branch intentionally.
+      if (typeof window.AndroidRtc !== 'undefined') {
+        if (typeof entry.file.sendChunk !== 'function') {
+          if (!aborted) {
+            aborted = true;
+            const msg = '[sendChunks] ANDROID: file is not a NativeFile — sendChunk() absent. ' +
+              'File must be picked via the native Kotlin picker. Legacy base64 path is not supported on Android. ' +
+              'fileId=' + fileId.slice(0, 8) + ' file=' + (entry.file?.name ?? '(unknown)');
+            console.error(msg);
+            this.onMessage?.({ type: 'system', text: 'File transfer failed: please use the native file picker (not the browser picker) on Android.', subtype: 'warning' });
+          }
+          return;
+        }
         const offset    = chunk.index * effectiveChunkSize;
         const poolIndex = chunk.index % dcPool.length;
         const ok = entry.file.sendChunk(
@@ -1019,12 +1062,20 @@ export class Room {
           if (chunk.index === 0) console.log('[sendChunks] FAST-PATH active — readAndSendChunk() confirmed for', fileId.slice(0,8));
           return;
         }
-        // ok===false: Kotlin returned false (DC not open, key not ready, etc.)
-        // or readAndSendChunk is absent on this build. Fall through to legacy.
-        if (chunk.index === 0) console.warn('[sendChunks] fast-path unavailable (sendChunk=false) — falling back to legacy path for', fileId.slice(0,8));
+        // ok===false: readAndSendChunk returned false (DC not open, key not ready,
+        // or Kotlin build predates readAndSendChunk).  Abort the transfer — there
+        // is no legacy fallback on Android.
+        if (!aborted) {
+          aborted = true;
+          console.error('[sendChunks] ANDROID: readAndSendChunk() returned false at chunk', chunk.index,
+            '— DC not open or Kotlin build outdated. fileId=', fileId.slice(0, 8));
+          this.onMessage?.({ type: 'system', text: 'File transfer failed: native send returned an error. Please retry or update the app.', subtype: 'warning' });
+        }
+        return;
       }
 
-      // ── Legacy path (desktop, or fast-path fallback) ──────────────────────
+      // ── Desktop / mobile-browser path ─────────────────────────────────────
+      // AndroidRtc is absent — standard JS encrypt + sendOnChannel path.
       let chunkBuf = chunk.data;
       if (this._crypto) chunkBuf = await this._crypto.encrypt(chunk.data, 'session');
       if (this._cancelled.has(fileId) || aborted) return; // recheck after async encrypt
@@ -1049,15 +1100,6 @@ export class Room {
         } else {
           return;
         }
-      }
-
-      if (isAndroidPeer) {
-        // Pool path: same as desktop. Kotlin's parseDCFrame now strips the
-        // 12-byte _sendOnDC transport header, so the 4-pool striped path works
-        // for Android peers. HOL blocking and the 512 KB buffer ceiling are gone.
-        const dc = dcPool[chunk.index % dcPool.length];
-        await this._rtc.sendOnChannel(dc, frame);
-        return;
       }
 
       const dc = dcPool[chunk.index % dcPool.length];
