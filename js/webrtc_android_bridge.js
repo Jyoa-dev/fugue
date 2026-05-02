@@ -441,8 +441,10 @@ export function initAndroidBridge(WebRTCMesh) {
            'size=', size, '| fast-path: sendChunk() will call readAndSendChunk()');
     }
     async arrayBuffer() {
-      _warn('NativeFile.arrayBuffer() called — SLOW PATH (reads via bridge base64)', this.name);
-      return _readNativeRange(this._token, 0, this.size);
+      // The send path is fully native — JS must never read file bytes.
+      // If this is called, readAndSendChunk failed and the caller fell through
+      // to the legacy path, which is a bug. Throw so it surfaces immediately.
+      throw new Error('[android-bridge] NativeFile.arrayBuffer() called — native send path broken. token=' + this._token.slice(0,8) + ' name=' + this.name);
     }
     slice(start = 0, end = this.size) {
       return new NativeBlob(this._token, start, end - start, this.type);
@@ -468,8 +470,10 @@ export function initAndroidBridge(WebRTCMesh) {
       this._length = length; this.size = length; this.type = type;
     }
     async arrayBuffer() {
-      _warn('NativeBlob.arrayBuffer() called — SLOW PATH (reads via bridge base64) offset=', this._offset);
-      return _readNativeRange(this._token, this._offset, this._length);
+      // The send path is fully native — JS must never read file bytes.
+      // If this is called, readAndSendChunk failed and the caller fell through
+      // to the legacy path, which is a bug. Throw so it surfaces immediately.
+      throw new Error('[android-bridge] NativeBlob.arrayBuffer() called — native send path broken. token=' + this._token.slice(0,8) + ' offset=' + this._offset);
     }
 
     /**
@@ -508,13 +512,6 @@ export function initAndroidBridge(WebRTCMesh) {
         encryptedFlag,
       );
     }
-  }
-
-  async function _readNativeRange(token, offset, length) {
-    if (length <= 0) return new ArrayBuffer(0);
-    const b64 = window.AndroidRtc.readFileChunk(token, offset, length);
-    if (!b64) return new ArrayBuffer(0);
-    return _fromB64(b64);
   }
 
   // ── Frame helpers ─────────────────────────────────────────────────────────
