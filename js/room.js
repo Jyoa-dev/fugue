@@ -321,7 +321,12 @@ export class Room {
         // receiver). Do NOT release the NativeFile token here: the FileChannel
         // must stay open until _sendChunks() has drained all chunks.
         // release() is stored on the fileStore entry and called by _sendChunks().
-        this.shareFile(nativeFile).catch(err => {
+        this.shareFile(nativeFile).then(fileId => {
+          if (fileId) {
+            if (!this._nativeFiles) this._nativeFiles = new Map();
+            this._nativeFiles.set(fileId, nativeFile);
+          }
+        }).catch(err => {
           console.error('[room] shareFile(NativeFile) failed:', err);
           nativeFile.release?.(); // release immediately only on shareFile error
         });
@@ -1161,14 +1166,9 @@ export class Room {
     }
     console.log('[sendChunks] done, sent', chunkCount, 'chunks', aborted ? '(aborted)' : '');
 
-    // Release the Kotlin-side FileChannel now that all chunks have been read.
-    // Must happen here — not in shareFile()'s finally — because shareFile() resolves
-    // before file_request arrives and _sendChunks runs. Releasing earlier closes the
-    // FileChannel and makes readAndSendChunk return false for every chunk.
-    if (typeof entry.file.release === 'function') {
-      console.log('[sendChunks] releasing NativeFile token for', fileId.slice(0, 8));
-      entry.file.release();
-    }
+    // NOTE: do NOT release the NativeFile token here. Any peer can re-request the
+    // file at any time (e.g. cancel + re-download), and the token must remain valid
+    // for subsequent _sendChunks calls. The token is released when the session ends.
 
     if (!aborted && !this._cancelled.has(fileId)) {
       this.fileStore.addReceipt(fileId, requesterId, this.peers.get(requesterId)?.identity || requesterId, 'sent');
@@ -1288,6 +1288,7 @@ export class Room {
     this.relay.send({ type: 'file_announce', fileId, name: file.name, size: file.size, mimeType: file.type, encrypted: !!this._crypto, senderId: this.myPeerId, senderName: this.identity, totalChunks, compression });
     this.onFileUpdate?.();
     this.onMessage?.({ type: 'file_announce', senderId: this.myPeerId, senderName: this.identity, fileId, name: file.name, size: file.size, self: true });
+    return fileId;
   }
 
   requestFile(fileId) {
@@ -1388,5 +1389,12 @@ export class Room {
     this.relay.send({ type: 'leave' });
     this.relay.disconnect();
     this._crypto?.terminate();
+    // Release all NativeFile tokens so Kotlin closes the FileChannels.
+    if (typeof window.AndroidRtc !== 'undefined' && this._nativeFiles) {
+      for (const [, file] of this._nativeFiles) {
+        if (typeof file?.release === 'function') file.release();
+      }
+      this._nativeFiles.clear();
+    }
   }
 }
