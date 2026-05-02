@@ -979,7 +979,7 @@ export class Room {
     // route through native WebRTC; the LAN TCP path is an additional shortcut
     // for very large files where TCP throughput exceeds SCTP.
     let useLan = false;
-    if (entry.file.size >= LAN_MIN_SIZE && typeof window.AndroidRtc !== 'undefined') {
+    if (entry.file.size >= LAN_MIN_SIZE && typeof window.AndroidRtc !== 'undefined' && isRemoteAndroid) {
       console.log('[lan] file is', (entry.file.size / 1024 / 1024).toFixed(1), 'MB — attempting LAN connect to', requesterId.slice(0, 8));
       useLan = await this._waitForLanReady(requesterId, 10_000);
       console.log('[lan] useLan =', useLan);
@@ -991,14 +991,13 @@ export class Room {
     // completes, so reading _androidPeers before getPoolChannels (which waits
     // for the connection to be live) would race and return false for Android
     // peers. All Android-dependent values are derived here, after the awaits.
-    // isAndroidPeer: true if the remote peer is Android OR if we ourselves are
-    // Android (sender). When Android is the sender, readAndSendChunk calls dc.send()
-    // directly in Kotlin — the chunk must fit within the 256 KB SCTP ceiling
-    // regardless of who the receiver is. Using the desktop 512 KB chunk size causes
-    // libwebrtc to close the DC immediately after the first send.
-    const isAndroidPeer = this._rtc._androidPeers?.has(requesterId) === true
-                       || typeof window.AndroidRtc !== 'undefined';
-    console.log('[sendChunks] isAndroidPeer:', isAndroidPeer, 'for', requesterId.slice(0, 8));
+    // isRemoteAndroid: the receiver is an Android peer (detected via _android flag in their offer/answer).
+    const isRemoteAndroid = this._rtc._androidPeers?.has(requesterId) === true;
+    // isAndroidPeer: true if either side is Android — controls chunk size.
+    // When WE are Android (sender), readAndSendChunk calls dc.send() directly in
+    // Kotlin so the chunk must fit in 256 KB regardless of what the receiver is.
+    const isAndroidPeer = isRemoteAndroid || typeof window.AndroidRtc !== 'undefined';
+    console.log('[sendChunks] isAndroidPeer:', isAndroidPeer, 'isRemoteAndroid:', isRemoteAndroid, 'for', requesterId.slice(0, 8));
 
     // effectiveChunkSize: pool path uses _sendOnDC which auto-fragments, so
     // no Android-specific cap is needed. Both peer types use the same chunk size.
