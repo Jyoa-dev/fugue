@@ -1,11 +1,30 @@
 // ── webrtc.js — WebRTC DataChannel peer mesh ────────────────────────────
-// Multiple STUN servers: ICE picks the fastest, others are fallbacks.
-// STUN only discovers your public IP/port — zero file data touches these servers.
+// ICE server list: STUN (free, zero data touches them) + TURN (relay, only
+// used when both STUN candidates fail — symmetric NAT, strict corporate NAT).
+//
+// TURN is opt-in via __FUGUE_TURN_CONFIG__ which the server injects at build
+// time or at runtime via a <script> before this module loads:
+//
+//   window.__FUGUE_TURN_CONFIG__ = [
+//     { urls: 'turn:your.turn.server:3478',
+//       username: 'user', credential: 'pass' },
+//     { urls: 'turns:your.turn.server:5349',   // TLS fallback
+//       username: 'user', credential: 'pass' },
+//   ];
+//
+// If the variable is absent or empty the behaviour is identical to before —
+// STUN only, no relay. File data only reaches the TURN server when direct
+// ICE paths (host, srflx) are all unreachable; it is still end-to-end
+// encrypted so the relay server never sees plaintext.
+//
+// STUN only discovers your public IP/port — zero file data touches STUN servers.
+const _turnServers = (typeof window !== 'undefined' && window.__FUGUE_TURN_CONFIG__) || [];
 const ICE_SERVERS = [
   { urls: 'stun:stun.cloudflare.com:3478'   },
   { urls: 'stun:stun.l.google.com:19302'    },
   { urls: 'stun:stun1.l.google.com:19302'   },
   { urls: 'stun:stun.relay.metered.ca:80'   },
+  ..._turnServers,
 ];
 
 // Maximum payload bytes per _sendOnDC fragment — 2-tier by peer type.
@@ -618,8 +637,26 @@ export class WebRTCMesh extends EventTarget {
       }
     };
 
-    pc.oniceconnectionstatechange = () =>
+    pc.oniceconnectionstatechange = () => {
       console.log('[ice]', peerId.slice(0,8), pc.iceConnectionState);
+      // 'failed' fires faster than connectionState on some Android WebViews /
+      // mobile networks where symmetric NAT blocks all candidate pairs.
+      // Emit peer_failed here so the UX shows the NAT warning immediately
+      // rather than waiting up to ~30 s for the connection-state machine.
+      // Guard: only fire if connectionState hasn't already transitioned to
+      // failed/closed (avoids a double peer_failed dispatch on the same peer).
+      if (pc.iceConnectionState === 'failed') {
+        const cs = pc.connectionState;
+        if (cs !== 'failed' && cs !== 'closed') {
+          console.warn('[ice] iceConnectionState=failed before connectionState —',
+            'dispatching peer_failed early for', peerId.slice(0, 8),
+            '| connectionState:', cs,
+            _turnServers.length ? '' : '| no TURN configured');
+          this.dispatchEvent(new CustomEvent('peer_failed', { detail: { peerId } }));
+          this.removePeer(peerId);
+        }
+      }
+    };
 
     return pc;
   }

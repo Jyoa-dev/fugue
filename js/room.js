@@ -453,6 +453,37 @@ export class Room {
       this.onMessage?.({ type: 'system', text: `${identity}: ${TURN_WARNING}`, subtype: 'warning' });
     });
 
+    // ── Activity recreate reconciliation ─────────────────────────────────────
+    // Kotlin stamps window._nativeBridgeInstanceId with a fresh UUID each time
+    // NativeRtcBridge is constructed. onResume() calls _nativeBridgeResumed()
+    // on every foreground return, but we only act when the ID has changed —
+    // i.e. the Activity was recreated and NativeRtcBridge is brand-new.
+    // Normal foreground resumes (user switches back from another app, screen on)
+    // leave the ID unchanged and return immediately — no connections torn down.
+    if (typeof window.AndroidRtc !== 'undefined') {
+      let _lastBridgeId = window._nativeBridgeInstanceId ?? null;
+      window._nativeBridgeResumed = () => {
+        const currentId = window._nativeBridgeInstanceId ?? null;
+        if (currentId === _lastBridgeId) return; // same bridge — normal resume, no-op
+        _lastBridgeId = currentId;
+        console.warn('[room] _nativeBridgeResumed — bridge recreated (id changed), reconciling peer state');
+        const stale = [...this.peers.keys()].filter(id => id !== this.myPeerId);
+        if (stale.length === 0) return;
+        console.warn('[room] closing', stale.length, 'stale peer(s) after bridge recreate');
+        for (const peerId of stale) {
+          this._rtc?.removePeer(peerId);
+          const identity = this.peers.get(peerId)?.identity || peerId.slice(0, 8);
+          this.onMessage?.({ type: 'system',
+            text: `Reconnecting to ${identity} (app was backgrounded)…`, subtype: 'warning' });
+        }
+        // Re-initiate connections — relay WebSocket lives on the JS side,
+        // unaffected by NativeRtcBridge recreation.
+        for (const peerId of stale) {
+          if (this.peers.has(peerId)) this._rtc?.addPeer(peerId).catch(console.warn);
+        }
+      };
+    }
+
     // ── Kotlin → JS callbacks for native receive path ─────────────────────
     // Kotlin reassembles, decrypts, and saves inbound files entirely natively.
     // These callbacks are the only JS involvement on the receive side.
@@ -475,6 +506,10 @@ export class Room {
         this.fileStore.updateProgress(fileId, 1);
         this.onFileUpdate?.();
         this.onMessage?.({ type: 'system', text: `${name} saved to Downloads`, subtype: 'receipt' });
+        // Stop the foreground service if no other downloads are still active.
+        const activeDownloads = this.fileStore.getAll()
+          .filter(f => f.status === 'downloading').length;
+        if (activeDownloads === 0) window.AndroidRtc.stopTransferService?.();
       };
 
       window._nativeFileError = (fileId, name, msg) => {
@@ -483,12 +518,28 @@ export class Room {
         this.fileStore.setStatus(fileId, 'error');
         this.onFileUpdate?.();
         this.onMessage?.({ type: 'system', text: `Failed to save ${name}: ${msg}`, subtype: 'warning' });
+        const activeDownloads = this.fileStore.getAll()
+          .filter(f => f.status === 'downloading').length;
+        if (activeDownloads === 0) window.AndroidRtc.stopTransferService?.();
       };
 
       window._nativeRelayReceipt = (fileId, peerId) => {
         this.relay.send({ type: 'receipt', fileId, receiptType: 'downloaded', senderId: this.myPeerId, senderName: this.identity });
         if (this._crypto) this.relay.send({ type: 'receipt', fileId, receiptType: 'decrypted', senderId: this.myPeerId, senderName: this.identity });
       };
+
+      // ── Key derivation failure ─────────────────────────────────────────────
+      // Fired by Kotlin when setSessionKey() throws or gets an unsupported
+      // cipher/kdf. Without this handler the first encrypted transfer would
+      // silently stall — decrypt returns null, progress never reaches 100 %,
+      // and the user sees no feedback.
+      window._nativeKeyError = (msg) => {
+        console.error('[crypto] _nativeKeyError:', msg);
+        this.onMessage?.({ type: 'system',
+          text: `Encryption key setup failed on this device: ${msg}. Encrypted transfers will not work — try rejoining the room.`,
+          subtype: 'warning' });
+      };
+
     }
   }
 
@@ -1299,6 +1350,9 @@ export class Room {
     // in the same session without a fresh announce.
     if (typeof window.AndroidRtc !== 'undefined') window.AndroidRtc.resumeTransfer(fileId);
 
+    // Keep the process alive for the duration of the transfer.
+    if (typeof window.AndroidRtc !== 'undefined') window.AndroidRtc.startTransferService?.();
+
     let startChunk = 0;
 
     if (typeof window.AndroidRtc !== 'undefined') {
@@ -1373,6 +1427,12 @@ export class Room {
     // Notify the conversation so it can clear the inline progress bar and
     // reset the file message back to its pre-download (offer) state.
     this.onMessage?.({ type: 'file_cancel', fileId });
+    // Stop the foreground service if nothing else is downloading.
+    if (typeof window.AndroidRtc !== 'undefined') {
+      const activeDownloads = this.fileStore.getAll()
+        .filter(f => f.status === 'downloading').length;
+      if (activeDownloads === 0) window.AndroidRtc.stopTransferService?.();
+    }
   }
 
   get myColor() { return Identity.colorFor(this.identity); }
@@ -1396,5 +1456,8 @@ export class Room {
       }
       this._nativeFiles.clear();
     }
+    // Always stop the foreground service on leave — no transfers can be in
+    // progress once the room is torn down.
+    if (typeof window.AndroidRtc !== 'undefined') window.AndroidRtc.stopTransferService?.();
   }
 }
