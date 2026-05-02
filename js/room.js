@@ -1107,26 +1107,52 @@ export class Room {
       await this._rtc.sendOnChannel(dc, frame);
     };
 
-    // All peers now use the 4-pool striped path. Single concurrency value.
-    const activeConcurrency = dcPool.length * SEND_CONCURRENCY_PER_DC;
-    const lanes = new Array(activeConcurrency).fill(Promise.resolve());
-    let lane = 0;
+    // ── Android: native loop — never reads file bytes into JS ───────────────
+    // Chunker.chunkFile() calls file.slice().arrayBuffer() to materialise chunk
+    // data before sendOne() sees it. On Android that would cross the bridge and
+    // throw (NativeBlob.arrayBuffer is intentionally broken). Instead, drive the
+    // loop with plain index arithmetic and let readAndSendChunk read the bytes
+    // entirely in Kotlin. sendOne() receives a lightweight descriptor object with
+    // no .data field — the Android branch of sendOne() never touches chunk.data.
     let chunkCount = 0;
     let aborted = false;
-    for await (const chunk of Chunker.chunkFile(entry.file, effectiveChunkSize, startChunk)) {
-      if (this._cancelled.has(fileId)) { aborted = true; break; }
-      const l = lane++ % activeConcurrency;
-      await lanes[l];                                         // free the slot first
-      if (this._cancelled.has(fileId)) { aborted = true; break; }
-      if (chunkCount === 0) console.log('[sendChunks] first chunk, total:', chunk.total);
-      chunkCount++;
-      lanes[l] = sendOne(chunk);
-    }
-    // Drain in-flight lanes, but ignore errors from closed DCs when aborted.
-    if (aborted) {
-      await Promise.allSettled(lanes);
+    if (typeof window.AndroidRtc !== 'undefined' && typeof entry.file.sendChunk === 'function') {
+      const activeConcurrency = dcPool.length * SEND_CONCURRENCY_PER_DC;
+      const lanes = new Array(activeConcurrency).fill(Promise.resolve());
+      let lane = 0;
+      for (let i = startChunk; i < effectiveTotalChunks; i++) {
+        if (this._cancelled.has(fileId)) { aborted = true; break; }
+        const l = lane++ % activeConcurrency;
+        await lanes[l];
+        if (this._cancelled.has(fileId)) { aborted = true; break; }
+        if (chunkCount === 0) console.log('[sendChunks] first chunk (native loop), total:', effectiveTotalChunks);
+        chunkCount++;
+        lanes[l] = sendOne({ index: i, total: effectiveTotalChunks, data: null });
+      }
+      if (aborted) {
+        await Promise.allSettled(lanes);
+      } else {
+        await Promise.all(lanes);
+      }
     } else {
-      await Promise.all(lanes);
+      // ── Desktop / mobile-browser: Chunker reads file bytes into JS ──────────
+      const activeConcurrency = dcPool.length * SEND_CONCURRENCY_PER_DC;
+      const lanes = new Array(activeConcurrency).fill(Promise.resolve());
+      let lane = 0;
+      for await (const chunk of Chunker.chunkFile(entry.file, effectiveChunkSize, startChunk)) {
+        if (this._cancelled.has(fileId)) { aborted = true; break; }
+        const l = lane++ % activeConcurrency;
+        await lanes[l];                                       // free the slot first
+        if (this._cancelled.has(fileId)) { aborted = true; break; }
+        if (chunkCount === 0) console.log('[sendChunks] first chunk, total:', chunk.total);
+        chunkCount++;
+        lanes[l] = sendOne(chunk);
+      }
+      if (aborted) {
+        await Promise.allSettled(lanes);
+      } else {
+        await Promise.all(lanes);
+      }
     }
     console.log('[sendChunks] done, sent', chunkCount, 'chunks', aborted ? '(aborted)' : '');
 
