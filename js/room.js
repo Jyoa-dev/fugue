@@ -978,13 +978,6 @@ export class Room {
     // On Android, the bridge's patched sendOnChannel/getPoolChannels already
     // route through native WebRTC; the LAN TCP path is an additional shortcut
     // for very large files where TCP throughput exceeds SCTP.
-    let useLan = false;
-    if (entry.file.size >= LAN_MIN_SIZE && typeof window.AndroidRtc !== 'undefined' && isRemoteAndroid) {
-      console.log('[lan] file is', (entry.file.size / 1024 / 1024).toFixed(1), 'MB — attempting LAN connect to', requesterId.slice(0, 8));
-      useLan = await this._waitForLanReady(requesterId, 10_000);
-      console.log('[lan] useLan =', useLan);
-    }
-
     // ── Android peer detection — evaluated AFTER pool/peer handshake ──────
     // _androidPeers is populated when the WebRTC offer/answer is processed.
     // file_request can arrive over the relay before the WebRTC handshake
@@ -998,6 +991,13 @@ export class Room {
     // Kotlin so the chunk must fit in 256 KB regardless of what the receiver is.
     const isAndroidPeer = isRemoteAndroid || typeof window.AndroidRtc !== 'undefined';
     console.log('[sendChunks] isAndroidPeer:', isAndroidPeer, 'isRemoteAndroid:', isRemoteAndroid, 'for', requesterId.slice(0, 8));
+
+    let useLan = false;
+    if (entry.file.size >= LAN_MIN_SIZE && typeof window.AndroidRtc !== 'undefined' && isRemoteAndroid) {
+      console.log('[lan] file is', (entry.file.size / 1024 / 1024).toFixed(1), 'MB — attempting LAN connect to', requesterId.slice(0, 8));
+      useLan = await this._waitForLanReady(requesterId, 10_000);
+      console.log('[lan] useLan =', useLan);
+    }
 
     // effectiveChunkSize: pool path uses _sendOnDC which auto-fragments, so
     // no Android-specific cap is needed. Both peer types use the same chunk size.
